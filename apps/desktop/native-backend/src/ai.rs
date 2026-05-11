@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -86,6 +86,10 @@ const AUTH_TERMINAL_DEFAULT_ROWS: u16 = 28;
 const AUTH_TERMINAL_MONITOR_INTERVAL: Duration = Duration::from_millis(120);
 const AUTH_TERMINAL_OUTPUT_CHUNK_SIZE: usize = 4096;
 const ACP_SESSION_START_TIMEOUT: Duration = Duration::from_secs(15);
+const RUNTIME_SETUP_STORE_VERSION: u32 = 2;
+const RUNTIME_SECRET_SERVICE: &str = "NeverWrite AI Provider Secrets";
+const RUNTIME_SECRET_STORE_MODE_ENV: &str = "NEVERWRITE_AI_SECRET_STORE";
+const RUNTIME_SETUP_LOAD_ERROR_MESSAGE: &str = "Secure credential storage is unavailable. Reconnect this AI provider or configure an environment variable before starting a session.";
 
 #[derive(Debug, Clone)]
 struct TerminalExitMeta {
@@ -239,6 +243,443 @@ struct RuntimeSetupState {
     env: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRuntimeSetupFile {
+    version: u32,
+    runtimes: HashMap<String, PersistedRuntimeSetupState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRuntimeSetupState {
+    custom_binary_path: Option<String>,
+    auth_method: Option<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    secret_env_keys: Vec<String>,
+}
+
+trait RuntimeSecretStore: Send + Sync {
+    fn get_secret(&self, runtime_id: &str, env_key: &str) -> Result<Option<String>, String>;
+    fn set_secret(&self, runtime_id: &str, env_key: &str, value: &str) -> Result<(), String>;
+    fn delete_secret(&self, runtime_id: &str, env_key: &str) -> Result<(), String>;
+}
+
+#[derive(Debug)]
+struct OsRuntimeSecretStore;
+
+impl OsRuntimeSecretStore {
+    fn entry(runtime_id: &str, env_key: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(
+            RUNTIME_SECRET_SERVICE,
+            &runtime_secret_account(runtime_id, env_key),
+        )
+        .map_err(|error| format!("Secure credential storage is unavailable: {error}"))
+    }
+}
+
+impl RuntimeSecretStore for OsRuntimeSecretStore {
+    fn get_secret(&self, runtime_id: &str, env_key: &str) -> Result<Option<String>, String> {
+        match Self::entry(runtime_id, env_key)?.get_password() {
+            Ok(value) => Ok(normalize_optional_string(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(format!(
+                "Failed to read AI provider secret from secure storage: {error}"
+            )),
+        }
+    }
+
+    fn set_secret(&self, runtime_id: &str, env_key: &str, value: &str) -> Result<(), String> {
+        Self::entry(runtime_id, env_key)?
+            .set_password(value)
+            .map_err(|error| {
+                format!("Failed to save AI provider secret to secure storage: {error}")
+            })
+    }
+
+    fn delete_secret(&self, runtime_id: &str, env_key: &str) -> Result<(), String> {
+        match Self::entry(runtime_id, env_key)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(format!(
+                "Failed to remove AI provider secret from secure storage: {error}"
+            )),
+        }
+    }
+}
+
+#[derive(Default)]
+struct InMemoryRuntimeSecretStore {
+    values: Mutex<HashMap<(String, String), String>>,
+}
+
+impl RuntimeSecretStore for InMemoryRuntimeSecretStore {
+    fn get_secret(&self, runtime_id: &str, env_key: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .values
+            .lock()
+            .map_err(|error| format!("Test secret store lock error: {error}"))?
+            .get(&(runtime_id.to_string(), env_key.to_string()))
+            .cloned())
+    }
+
+    fn set_secret(&self, runtime_id: &str, env_key: &str, value: &str) -> Result<(), String> {
+        self.values
+            .lock()
+            .map_err(|error| format!("Test secret store lock error: {error}"))?
+            .insert(
+                (runtime_id.to_string(), env_key.to_string()),
+                value.to_string(),
+            );
+        Ok(())
+    }
+
+    fn delete_secret(&self, runtime_id: &str, env_key: &str) -> Result<(), String> {
+        self.values
+            .lock()
+            .map_err(|error| format!("Test secret store lock error: {error}"))?
+            .remove(&(runtime_id.to_string(), env_key.to_string()));
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeSetupStore {
+    path: PathBuf,
+    secrets: Arc<dyn RuntimeSecretStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSecretStoreMode {
+    OsKeyring,
+    InMemory,
+}
+
+impl RuntimeSetupStore {
+    fn new(path: PathBuf) -> Self {
+        Self::with_secret_store(path, Self::default_secret_store())
+    }
+
+    fn with_secret_store(path: PathBuf, secrets: Arc<dyn RuntimeSecretStore>) -> Self {
+        Self { path, secrets }
+    }
+
+    fn default_secret_store() -> Arc<dyn RuntimeSecretStore> {
+        match runtime_secret_store_mode_from_env(
+            std::env::var(RUNTIME_SECRET_STORE_MODE_ENV).ok().as_deref(),
+        ) {
+            RuntimeSecretStoreMode::OsKeyring => Arc::new(OsRuntimeSecretStore),
+            // This is intentionally opt-in for CI/smoke tests that run without a
+            // desktop keyring service. Production keeps using OS secure storage.
+            RuntimeSecretStoreMode::InMemory => Arc::new(InMemoryRuntimeSecretStore::default()),
+        }
+    }
+
+    fn load(&self) -> Result<HashMap<String, RuntimeSetupState>, String> {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(error) => {
+                return Err(format!("Failed to read AI runtime setup store: {error}"));
+            }
+        };
+        let persisted: PersistedRuntimeSetupFile = serde_json::from_str(&raw)
+            .map_err(|error| format!("Failed to parse AI runtime setup store: {error}"))?;
+        if !matches!(persisted.version, 1 | RUNTIME_SETUP_STORE_VERSION) {
+            return Ok(HashMap::new());
+        }
+
+        let mut setup = HashMap::new();
+        let mut should_rewrite_store = false;
+        for (runtime_id, persisted_setup) in persisted.runtimes {
+            if validate_runtime_id(&runtime_id).is_err() {
+                should_rewrite_store = true;
+                continue;
+            }
+            let mut env = HashMap::new();
+            for (key, value) in persisted_setup.env {
+                let Some(value) = normalize_optional_string(value) else {
+                    continue;
+                };
+                if is_secret_runtime_env_key(&key) {
+                    should_rewrite_store = true;
+                    if is_secret_env_key_for_runtime(&runtime_id, &key) {
+                        self.secrets.set_secret(&runtime_id, &key, &value)?;
+                        env.insert(key, value);
+                    }
+                    // Cross-runtime secrets are intentionally dropped instead of being
+                    // written to this runtime's credential namespace.
+                    continue;
+                } else {
+                    env.insert(key, value);
+                }
+            }
+            let mut secret_env_keys = persisted_setup
+                .secret_env_keys
+                .into_iter()
+                .filter(|key| {
+                    let allowed = is_secret_env_key_for_runtime(&runtime_id, key);
+                    if !allowed && is_secret_runtime_env_key(key) {
+                        should_rewrite_store = true;
+                    }
+                    allowed
+                })
+                .collect::<HashSet<_>>();
+            for key in env
+                .keys()
+                .filter(|key| is_secret_env_key_for_runtime(&runtime_id, key))
+            {
+                secret_env_keys.insert(key.clone());
+            }
+            for key in secret_env_keys {
+                if env.contains_key(&key) {
+                    continue;
+                }
+                if let Some(value) = self.secrets.get_secret(&runtime_id, &key)? {
+                    env.insert(key, value);
+                }
+            }
+            let mut runtime_setup = RuntimeSetupState {
+                custom_binary_path: persisted_setup
+                    .custom_binary_path
+                    .and_then(normalize_optional_string),
+                auth_method: persisted_setup
+                    .auth_method
+                    .and_then(normalize_optional_string),
+                env,
+                ..RuntimeSetupState::default()
+            };
+            refresh_runtime_setup_flags(&runtime_id, &mut runtime_setup);
+            if !runtime_setup
+                .auth_method
+                .as_deref()
+                .is_some_and(|method| auth_method_has_local_config(&runtime_setup, method))
+            {
+                runtime_setup.auth_method =
+                    local_auth_method_for_runtime(&runtime_id, &runtime_setup);
+            }
+            runtime_setup.auth_ready = has_local_auth_config(&runtime_id, &runtime_setup);
+            setup.insert(runtime_id, runtime_setup);
+        }
+        if should_rewrite_store {
+            self.save(&setup)?;
+        }
+        Ok(setup)
+    }
+
+    fn save(&self, setup: &HashMap<String, RuntimeSetupState>) -> Result<(), String> {
+        let runtimes = setup
+            .iter()
+            .filter_map(
+                |(runtime_id, setup)| match PersistedRuntimeSetupState::from_runtime_setup(
+                    runtime_id,
+                    setup,
+                    self.secrets.as_ref(),
+                ) {
+                    Ok(Some(persisted_setup)) => Some(Ok((runtime_id.clone(), persisted_setup))),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        if runtimes.is_empty() {
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("Failed to remove AI runtime setup store: {error}"));
+                }
+            }
+            return Ok(());
+        }
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create AI runtime setup directory: {error}"))?;
+        }
+
+        let persisted = PersistedRuntimeSetupFile {
+            version: RUNTIME_SETUP_STORE_VERSION,
+            runtimes,
+        };
+        let encoded = serde_json::to_vec_pretty(&persisted)
+            .map_err(|error| format!("Failed to encode AI runtime setup store: {error}"))?;
+        let temp_path = self.path.with_extension(format!(
+            "json.tmp-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        write_secret_file(&temp_path, &encoded)?;
+        replace_secret_file(&temp_path, &self.path).map_err(|error| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!("Failed to replace AI runtime setup store: {error}")
+        })
+    }
+}
+
+fn runtime_secret_store_mode_from_env(value: Option<&str>) -> RuntimeSecretStoreMode {
+    match value.map(str::trim) {
+        Some("memory") => RuntimeSecretStoreMode::InMemory,
+        _ => RuntimeSecretStoreMode::OsKeyring,
+    }
+}
+
+impl Default for RuntimeSetupStore {
+    fn default() -> Self {
+        Self::new(app_data_dir().join("ai").join("runtime-setup.json"))
+    }
+}
+
+#[cfg(test)]
+impl RuntimeSetupStore {
+    fn in_memory_for_tests() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "neverwrite-ai-runtime-setup-test-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        Self::with_secret_store(path, Arc::new(InMemoryRuntimeSecretStore::default()))
+    }
+}
+
+impl PersistedRuntimeSetupState {
+    fn from_runtime_setup(
+        runtime_id: &str,
+        setup: &RuntimeSetupState,
+        secrets: &dyn RuntimeSecretStore,
+    ) -> Result<Option<Self>, String> {
+        reconcile_runtime_secrets(runtime_id, setup, secrets)?;
+        let env = setup
+            .env
+            .iter()
+            .filter(|(key, _)| !is_secret_runtime_env_key(key))
+            .filter(|(_, value)| !value.trim().is_empty())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut secret_env_keys = setup
+            .env
+            .iter()
+            .filter(|(key, value)| {
+                is_secret_env_key_for_runtime(runtime_id, key) && !value.trim().is_empty()
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        secret_env_keys.sort();
+        let custom_binary_path = setup
+            .custom_binary_path
+            .clone()
+            .and_then(normalize_optional_string);
+        let auth_method = setup
+            .auth_method
+            .clone()
+            .and_then(normalize_optional_string)
+            .filter(|method| auth_method_has_local_config(setup, method));
+
+        if custom_binary_path.is_none()
+            && auth_method.is_none()
+            && env.is_empty()
+            && secret_env_keys.is_empty()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            custom_binary_path,
+            auth_method,
+            env,
+            secret_env_keys,
+        }))
+    }
+}
+
+fn runtime_secret_account(runtime_id: &str, env_key: &str) -> String {
+    format!("{runtime_id}:{env_key}")
+}
+
+fn is_secret_runtime_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "CODEX_API_KEY"
+            | "OPENAI_API_KEY"
+            | "ANTHROPIC_AUTH_TOKEN"
+            | "ANTHROPIC_API_KEY"
+            | "ANTHROPIC_CUSTOM_HEADERS"
+            | "GEMINI_API_KEY"
+            | "GOOGLE_API_KEY"
+    )
+}
+
+fn secret_env_keys_for_runtime(runtime_id: &str) -> &'static [&'static str] {
+    match runtime_id {
+        CODEX_RUNTIME_ID => &["CODEX_API_KEY", "OPENAI_API_KEY"],
+        CLAUDE_RUNTIME_ID => &[
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_CUSTOM_HEADERS",
+        ],
+        GEMINI_RUNTIME_ID => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        _ => &[],
+    }
+}
+
+fn is_secret_env_key_for_runtime(runtime_id: &str, env_key: &str) -> bool {
+    secret_env_keys_for_runtime(runtime_id).contains(&env_key)
+}
+
+fn reconcile_runtime_secrets(
+    runtime_id: &str,
+    setup: &RuntimeSetupState,
+    secrets: &dyn RuntimeSecretStore,
+) -> Result<(), String> {
+    for env_key in secret_env_keys_for_runtime(runtime_id) {
+        match setup
+            .env
+            .get(*env_key)
+            .and_then(|value| normalize_optional_string(value.clone()))
+        {
+            Some(value) => secrets.set_secret(runtime_id, env_key, &value)?,
+            None => secrets.delete_secret(runtime_id, env_key)?,
+        }
+    }
+    Ok(())
+}
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| format!("Failed to open AI runtime setup store: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("Failed to write AI runtime setup store: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("Failed to flush AI runtime setup store: {error}"))
+}
+
+#[cfg(windows)]
+fn replace_secret_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(target_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(temp_path, target_path)
+}
+
+#[cfg(not(windows))]
+fn replace_secret_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, target_path)
+}
+
 #[derive(Debug, Clone)]
 struct ManagedAiSession {
     session: AiSession,
@@ -253,6 +694,7 @@ struct NativeAiInner {
     sessions: HashMap<String, ManagedAiSession>,
     session_order: Vec<String>,
     setup: HashMap<String, RuntimeSetupState>,
+    setup_load_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,6 +821,7 @@ enum AcpConfigOptionRemoteCommand {
 pub(crate) struct NativeAi {
     inner: Arc<Mutex<NativeAiInner>>,
     event_tx: Sender<RpcOutput>,
+    setup_store: RuntimeSetupStore,
     tool_diffs: ToolDiffState,
     agent_writes: AgentWriteTracker,
     auth_terminal_sessions: Arc<Mutex<HashMap<String, AuthTerminalHandle>>>,
@@ -387,9 +830,27 @@ pub(crate) struct NativeAi {
 
 impl NativeAi {
     pub(crate) fn new(event_tx: Sender<RpcOutput>) -> Self {
+        #[cfg(test)]
+        {
+            return Self::with_setup_store(event_tx, RuntimeSetupStore::in_memory_for_tests());
+        }
+        #[cfg(not(test))]
+        Self::with_setup_store(event_tx, RuntimeSetupStore::default())
+    }
+
+    fn with_setup_store(event_tx: Sender<RpcOutput>, setup_store: RuntimeSetupStore) -> Self {
+        let (setup, setup_load_error) = match setup_store.load() {
+            Ok(setup) => (setup, None),
+            Err(error) => (HashMap::new(), Some(runtime_setup_load_error(error))),
+        };
         Self {
-            inner: Arc::new(Mutex::new(NativeAiInner::default())),
+            inner: Arc::new(Mutex::new(NativeAiInner {
+                setup,
+                setup_load_error,
+                ..NativeAiInner::default()
+            })),
             event_tx,
+            setup_store,
             tool_diffs: ToolDiffState::default(),
             agent_writes: AgentWriteTracker::default(),
             auth_terminal_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -407,6 +868,9 @@ impl NativeAi {
             .inner
             .lock()
             .map_err(|error| format!("Internal AI state error: {error}"))?;
+        if let Some(message) = state.setup_load_error.clone() {
+            return Ok(json!(setup_load_error_status_for(&runtime_id, message)?));
+        }
         Ok(json!(setup_status_for(
             &runtime_id,
             state.setup.get(&runtime_id).cloned().unwrap_or_default(),
@@ -438,13 +902,21 @@ impl NativeAi {
             .map(|descriptor| {
                 let runtime_id = descriptor.runtime.id.clone();
                 let runtime_name = descriptor.runtime.name.clone();
-                let setup_status = self
+                let (setup_status, setup_load_error) = self
                     .inner
                     .lock()
                     .ok()
-                    .and_then(|state| state.setup.get(&runtime_id).cloned())
+                    .map(|state| {
+                        (
+                            state.setup.get(&runtime_id).cloned().unwrap_or_default(),
+                            state.setup_load_error.clone(),
+                        )
+                    })
                     .unwrap_or_default();
-                let status = setup_status_for(&runtime_id, setup_status);
+                let status = match setup_load_error {
+                    Some(message) => setup_load_error_status_for(&runtime_id, message),
+                    None => setup_status_for(&runtime_id, setup_status),
+                };
                 let (setup_status, setup_error) = match status {
                     Ok(status) => (Some(status), None),
                     Err(error) => (None, Some(error)),
@@ -481,18 +953,33 @@ impl NativeAi {
                 .ok_or_else(|| "Missing argument: input".to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|error| format!("Internal AI state error: {error}"))?;
-        let setup = state.setup.entry(runtime_id.clone()).or_default();
+        let (mut pending_setup, setup_load_error) = {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|error| format!("Internal AI state error: {error}"))?;
+            (state.setup.clone(), state.setup_load_error.clone())
+        };
+        if setup_load_error.is_some() {
+            pending_setup = self.setup_store.load().map_err(runtime_setup_load_error)?;
+        }
+        let setup = pending_setup.entry(runtime_id.clone()).or_default();
 
         setup.custom_binary_path = input
             .custom_binary_path
             .clone()
             .and_then(normalize_optional_string);
         update_auth_state(setup, &runtime_id, input)?;
-        Ok(json!(setup_status_for(&runtime_id, setup.clone())?))
+        let status = setup_status_for(&runtime_id, setup.clone())?;
+        self.setup_store.save(&pending_setup)?;
+
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|error| format!("Internal AI state error: {error}"))?;
+        state.setup = pending_setup;
+        state.setup_load_error = None;
+        Ok(json!(status))
     }
 
     pub(crate) fn start_auth(&self, args: &Value) -> Result<Value, String> {
@@ -559,27 +1046,39 @@ impl NativeAi {
         validate_runtime_id(&runtime_id)?;
         let cwd = resolve_auth_terminal_cwd(args.get("vaultPath").and_then(Value::as_str))?;
 
-        let setup = self
-            .inner
-            .lock()
-            .map_err(|error| format!("Internal AI state error: {error}"))?
-            .setup
-            .get(&runtime_id)
-            .cloned()
-            .unwrap_or_default();
+        let (setup_snapshot, setup_load_error) = {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|error| format!("Internal AI state error: {error}"))?;
+            (state.setup.clone(), state.setup_load_error.clone())
+        };
+        let mut pending_setup = if setup_load_error.is_some() {
+            self.setup_store.load().map_err(runtime_setup_load_error)?
+        } else {
+            setup_snapshot
+        };
+        let setup_for_logout = pending_setup.get(&runtime_id).cloned().unwrap_or_default();
 
-        if runtime_id == CODEX_RUNTIME_ID && setup.auth_method.as_deref() == Some("chatgpt") {
-            let spec = acp_process_spec(&runtime_id, &setup, cwd)?;
+        if runtime_id == CODEX_RUNTIME_ID
+            && setup_for_logout.auth_method.as_deref() == Some("chatgpt")
+        {
+            let spec = acp_process_spec(&runtime_id, &setup_for_logout, cwd)?;
             run_acp_logout(spec)?;
         }
+
+        let setup = pending_setup.entry(runtime_id.clone()).or_default();
+        clear_runtime_auth_state(setup);
+        let status = setup_status_for(&runtime_id, setup.clone())?;
+        self.setup_store.save(&pending_setup)?;
 
         let mut state = self
             .inner
             .lock()
             .map_err(|error| format!("Internal AI state error: {error}"))?;
-        let setup = state.setup.entry(runtime_id.clone()).or_default();
-        clear_runtime_auth_state(setup);
-        Ok(json!(setup_status_for(&runtime_id, setup.clone())?))
+        state.setup = pending_setup;
+        state.setup_load_error = None;
+        Ok(json!(status))
     }
 
     pub(crate) fn list_sessions(&self, vault_root: Option<PathBuf>) -> Result<Value, String> {
@@ -3667,6 +4166,29 @@ fn setup_status_for(
     })
 }
 
+fn runtime_setup_load_error(error: String) -> String {
+    format!("{RUNTIME_SETUP_LOAD_ERROR_MESSAGE} Details: {error}")
+}
+
+fn setup_load_error_status_for(
+    runtime_id: &str,
+    message: String,
+) -> Result<AiRuntimeSetupStatus, String> {
+    let visible_message = message.clone();
+    let mut setup = RuntimeSetupState {
+        suppress_persisted_auth: true,
+        message: Some(message),
+        ..RuntimeSetupState::default()
+    };
+    refresh_runtime_setup_flags(runtime_id, &mut setup);
+    let mut status = setup_status_for(runtime_id, setup)?;
+    status.auth_ready = false;
+    status.auth_method = None;
+    status.onboarding_required = true;
+    status.message = Some(visible_message);
+    Ok(status)
+}
+
 fn acp_process_spec(
     runtime_id: &str,
     setup: &RuntimeSetupState,
@@ -3968,6 +4490,47 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
+fn app_data_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("NEVERWRITE_APP_DATA_DIR") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("NeverWrite");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("NeverWrite");
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(xdg_data_home).join("NeverWrite");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("NeverWrite");
+        }
+    }
+
+    std::env::temp_dir().join("NeverWrite")
+}
+
 fn resolve_command_candidate(raw: &str, source: AiRuntimeBinarySource) -> ResolvedAcpCommand {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -4160,18 +4723,63 @@ fn auth_method_has_local_config(setup: &RuntimeSetupState, method_id: &str) -> b
     }
 }
 
-fn has_local_auth_config(setup: &RuntimeSetupState) -> bool {
-    setup.has_gateway_config
-        || [
-            "CODEX_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_API_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-        ]
-        .into_iter()
-        .any(|key| setup.env.get(key).is_some_and(|value| !value.is_empty()))
+fn local_auth_method_for_runtime(runtime_id: &str, setup: &RuntimeSetupState) -> Option<String> {
+    match runtime_id {
+        CODEX_RUNTIME_ID => setup
+            .env
+            .get("CODEX_API_KEY")
+            .is_some_and(|value| !value.is_empty())
+            .then(|| "codex-api-key".to_string())
+            .or_else(|| {
+                setup
+                    .env
+                    .get("OPENAI_API_KEY")
+                    .is_some_and(|value| !value.is_empty())
+                    .then(|| "openai-api-key".to_string())
+            }),
+        CLAUDE_RUNTIME_ID => setup
+            .has_gateway_config
+            .then(|| "gateway".to_string())
+            .or_else(|| {
+                setup
+                    .env
+                    .get("ANTHROPIC_API_KEY")
+                    .is_some_and(|value| !value.is_empty())
+                    .then(|| "anthropic-api-key".to_string())
+            })
+            .or_else(|| {
+                setup
+                    .env
+                    .get("ANTHROPIC_AUTH_TOKEN")
+                    .is_some_and(|value| !value.is_empty())
+                    .then(|| "console-login".to_string())
+            }),
+        GEMINI_RUNTIME_ID => ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+            .into_iter()
+            .any(|key| setup.env.get(key).is_some_and(|value| !value.is_empty()))
+            .then(|| "use_gemini".to_string()),
+        _ => None,
+    }
+}
+
+fn has_local_auth_config(runtime_id: &str, setup: &RuntimeSetupState) -> bool {
+    (runtime_id == CLAUDE_RUNTIME_ID && setup.has_gateway_config)
+        || secret_env_keys_for_runtime(runtime_id)
+            .iter()
+            .any(|key| setup.env.get(*key).is_some_and(|value| !value.is_empty()))
+}
+
+fn refresh_runtime_setup_flags(runtime_id: &str, setup: &mut RuntimeSetupState) {
+    setup.has_gateway_url = setup
+        .env
+        .get("ANTHROPIC_BASE_URL")
+        .is_some_and(|value| !value.is_empty());
+    setup.has_gateway_config = runtime_id == CLAUDE_RUNTIME_ID
+        && (setup.has_gateway_url
+            || setup
+                .env
+                .get("ANTHROPIC_CUSTOM_HEADERS")
+                .is_some_and(|value| !value.is_empty()));
 }
 
 fn clear_runtime_auth_state(setup: &mut RuntimeSetupState) {
@@ -4482,22 +5090,21 @@ fn update_auth_state(
         }
     }
 
-    setup.has_gateway_url = setup
-        .env
-        .get("ANTHROPIC_BASE_URL")
-        .is_some_and(|value| !value.is_empty());
-    setup.has_gateway_config = runtime_id == CLAUDE_RUNTIME_ID
-        && (setup.has_gateway_url
-            || setup
-                .env
-                .get("ANTHROPIC_CUSTOM_HEADERS")
-                .is_some_and(|value| !value.is_empty()));
+    refresh_runtime_setup_flags(runtime_id, setup);
     if setup.has_gateway_config && gateway_config_touched {
         setup.auth_method = Some("gateway".to_string());
         touched_auth = true;
     }
     if touched_auth {
-        setup.auth_ready = has_local_auth_config(setup);
+        setup.auth_ready = has_local_auth_config(runtime_id, setup);
+        if setup.auth_ready
+            && !setup
+                .auth_method
+                .as_deref()
+                .is_some_and(|method| auth_method_has_local_config(setup, method))
+        {
+            setup.auth_method = local_auth_method_for_runtime(runtime_id, setup);
+        }
         setup.suppress_persisted_auth = false;
         setup.message = None;
     }
@@ -5225,6 +5832,82 @@ mod tests {
     const CODEX_ACP_SUBAGENT_WAITING_END_EVENT: &str = "waiting_end";
     const PARENT_RUNTIME_SESSION_ID: &str = "parent-runtime-session-id";
     const CHILD_RUNTIME_SESSION_ID: &str = "child-runtime-session-id";
+
+    fn test_native_ai_with_secret_store(
+        path: PathBuf,
+        secrets: Arc<dyn RuntimeSecretStore>,
+    ) -> NativeAi {
+        let (event_tx, _event_rx) = mpsc::channel();
+        NativeAi::with_setup_store(
+            event_tx,
+            RuntimeSetupStore::with_secret_store(path, secrets),
+        )
+    }
+
+    #[derive(Default)]
+    struct FailableRuntimeSecretStore {
+        values: Mutex<HashMap<(String, String), String>>,
+        fail_get: AtomicBool,
+        fail_set: AtomicBool,
+        fail_delete: AtomicBool,
+    }
+
+    impl FailableRuntimeSecretStore {
+        fn fail_set(&self, fail: bool) {
+            self.fail_set.store(fail, Ordering::Relaxed);
+        }
+
+        fn fail_delete(&self, fail: bool) {
+            self.fail_delete.store(fail, Ordering::Relaxed);
+        }
+
+        fn stored_secret(&self, runtime_id: &str, env_key: &str) -> Option<String> {
+            self.values
+                .lock()
+                .unwrap()
+                .get(&(runtime_id.to_string(), env_key.to_string()))
+                .cloned()
+        }
+    }
+
+    impl RuntimeSecretStore for FailableRuntimeSecretStore {
+        fn get_secret(&self, runtime_id: &str, env_key: &str) -> Result<Option<String>, String> {
+            if self.fail_get.load(Ordering::Relaxed) {
+                return Err("test get_secret failure".to_string());
+            }
+            Ok(self
+                .values
+                .lock()
+                .map_err(|error| format!("Test secret store lock error: {error}"))?
+                .get(&(runtime_id.to_string(), env_key.to_string()))
+                .cloned())
+        }
+
+        fn set_secret(&self, runtime_id: &str, env_key: &str, value: &str) -> Result<(), String> {
+            if self.fail_set.load(Ordering::Relaxed) {
+                return Err("test set_secret failure".to_string());
+            }
+            self.values
+                .lock()
+                .map_err(|error| format!("Test secret store lock error: {error}"))?
+                .insert(
+                    (runtime_id.to_string(), env_key.to_string()),
+                    value.to_string(),
+                );
+            Ok(())
+        }
+
+        fn delete_secret(&self, runtime_id: &str, env_key: &str) -> Result<(), String> {
+            if self.fail_delete.load(Ordering::Relaxed) {
+                return Err("test delete_secret failure".to_string());
+            }
+            self.values
+                .lock()
+                .map_err(|error| format!("Test secret store lock error: {error}"))?
+                .remove(&(runtime_id.to_string(), env_key.to_string()));
+            Ok(())
+        }
+    }
 
     fn subagent_session_created_meta() -> Meta {
         Meta::from_iter([
@@ -7708,6 +8391,397 @@ mod tests {
             CLAUDE_RUNTIME_ID,
             "Authentication succeeded"
         ));
+    }
+
+    #[test]
+    fn runtime_secret_store_mode_requires_explicit_memory_value() {
+        assert_eq!(
+            runtime_secret_store_mode_from_env(Some("memory")),
+            RuntimeSecretStoreMode::InMemory
+        );
+        assert_eq!(
+            runtime_secret_store_mode_from_env(Some(" memory ")),
+            RuntimeSecretStoreMode::InMemory
+        );
+        assert_eq!(
+            runtime_secret_store_mode_from_env(None),
+            RuntimeSecretStoreMode::OsKeyring
+        );
+        assert_eq!(
+            runtime_secret_store_mode_from_env(Some("")),
+            RuntimeSecretStoreMode::OsKeyring
+        );
+        assert_eq!(
+            runtime_secret_store_mode_from_env(Some("plaintext")),
+            RuntimeSecretStoreMode::OsKeyring
+        );
+    }
+
+    #[test]
+    fn gemini_api_key_setup_persists_across_native_ai_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GEMINI_RUNTIME_ID,
+                "input": {
+                    "gemini_api_key": {
+                        "action": "set",
+                        "value": "gemini-test-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(!encoded.contains("gemini-test-secret"));
+        assert!(encoded.contains("GEMINI_API_KEY"));
+
+        let rehydrated_native_ai = test_native_ai_with_secret_store(store_path, secrets);
+        let status = rehydrated_native_ai
+            .get_setup_status(&json!({ "runtime_id": GEMINI_RUNTIME_ID }))
+            .unwrap();
+
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            status.get("auth_method").and_then(Value::as_str),
+            Some("use_gemini")
+        );
+        assert!(!status.to_string().contains("gemini-test-secret"));
+    }
+
+    #[test]
+    fn update_setup_secret_store_failure_does_not_commit_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+        secrets.fail_set(true);
+        let native_ai = test_native_ai_with_secret_store(store_path, secrets);
+
+        let error = native_ai
+            .update_setup(&json!({
+                "runtime_id": GEMINI_RUNTIME_ID,
+                "input": {
+                    "gemini_api_key": {
+                        "action": "set",
+                        "value": "gemini-new-secret",
+                    },
+                },
+            }))
+            .expect_err("secret store failure should reject setup update");
+
+        assert!(error.contains("test set_secret failure"));
+        assert!(!error.contains("gemini-new-secret"));
+        let state = native_ai.inner.lock().unwrap();
+        let setup = state
+            .setup
+            .get(GEMINI_RUNTIME_ID)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!setup.auth_ready);
+        assert!(!setup.env.contains_key("GEMINI_API_KEY"));
+    }
+
+    #[test]
+    fn legacy_plaintext_migration_failure_fails_closed_without_rewriting_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        fs::write(
+            &store_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "runtimes": {
+                    GEMINI_RUNTIME_ID: {
+                        "custom_binary_path": null,
+                        "auth_method": "use_gemini",
+                        "env": {
+                            "GEMINI_API_KEY": "legacy-gemini-secret"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let original = fs::read_to_string(&store_path).unwrap();
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+        secrets.fail_set(true);
+
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets);
+        let status = native_ai
+            .get_setup_status(&json!({ "runtime_id": GEMINI_RUNTIME_ID }))
+            .unwrap();
+
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status.get("onboarding_required").and_then(Value::as_bool),
+            Some(true)
+        );
+        let message = status
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("setup load failure should be visible");
+        assert!(message.contains("Secure credential storage is unavailable"));
+        assert!(!message.contains("legacy-gemini-secret"));
+        assert_eq!(fs::read_to_string(&store_path).unwrap(), original);
+
+        let update_error = native_ai
+            .update_setup(&json!({
+                "runtime_id": GEMINI_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": temp.path().join("fake-gemini")
+                },
+            }))
+            .expect_err("updates should not rewrite setup while migration is failing");
+        assert!(update_error.contains("Secure credential storage is unavailable"));
+        assert!(!update_error.contains("legacy-gemini-secret"));
+        assert_eq!(fs::read_to_string(&store_path).unwrap(), original);
+
+        let logout_error = native_ai
+            .logout(&json!({ "runtime_id": GEMINI_RUNTIME_ID }))
+            .expect_err("logout should not rewrite setup while migration is failing");
+        assert!(logout_error.contains("Secure credential storage is unavailable"));
+        assert!(!logout_error.contains("legacy-gemini-secret"));
+        assert_eq!(fs::read_to_string(&store_path).unwrap(), original);
+    }
+
+    #[test]
+    fn persisted_runtime_setup_redacts_gemini_codex_and_claude_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets);
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GEMINI_RUNTIME_ID,
+                "input": {
+                    "gemini_api_key": { "action": "set", "value": "gemini-secret" },
+                },
+            }))
+            .unwrap();
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": CODEX_RUNTIME_ID,
+                "input": {
+                    "openai_api_key": { "action": "set", "value": "openai-secret" },
+                },
+            }))
+            .unwrap();
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": CLAUDE_RUNTIME_ID,
+                "input": {
+                    "anthropic_api_key": { "action": "set", "value": "claude-secret" },
+                },
+            }))
+            .unwrap();
+
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(!encoded.contains("gemini-secret"));
+        assert!(!encoded.contains("openai-secret"));
+        assert!(!encoded.contains("claude-secret"));
+        assert!(encoded.contains("\"secret_env_keys\""));
+        assert!(encoded.contains("GEMINI_API_KEY"));
+        assert!(encoded.contains("OPENAI_API_KEY"));
+        assert!(encoded.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn legacy_plaintext_runtime_setup_is_migrated_to_secret_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        fs::write(
+            &store_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "runtimes": {
+                    GEMINI_RUNTIME_ID: {
+                        "custom_binary_path": null,
+                        "auth_method": "use_gemini",
+                        "env": {
+                            "GEMINI_API_KEY": "legacy-gemini-secret"
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
+
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+        let status = native_ai
+            .get_setup_status(&json!({ "runtime_id": GEMINI_RUNTIME_ID }))
+            .unwrap();
+
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            secrets
+                .get_secret(GEMINI_RUNTIME_ID, "GEMINI_API_KEY")
+                .expect("migrated secret should be readable"),
+            Some("legacy-gemini-secret".to_string())
+        );
+        let migrated = fs::read_to_string(&store_path).unwrap();
+        assert!(migrated.contains("\"version\": 2"));
+        assert!(!migrated.contains("legacy-gemini-secret"));
+    }
+
+    #[test]
+    fn cross_runtime_legacy_secret_is_not_valid_or_persisted_for_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        fs::write(
+            &store_path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "runtimes": {
+                    CODEX_RUNTIME_ID: {
+                        "custom_binary_path": null,
+                        "auth_method": "codex-api-key",
+                        "env": {
+                            "GEMINI_API_KEY": "wrong-runtime-secret"
+                        },
+                        "secret_env_keys": ["GEMINI_API_KEY"]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+        let status = native_ai
+            .get_setup_status(&json!({ "runtime_id": CODEX_RUNTIME_ID }))
+            .unwrap();
+
+        assert_ne!(
+            status.get("auth_method").and_then(Value::as_str),
+            Some("codex-api-key")
+        );
+        let setup = native_ai.inner.lock().unwrap();
+        let codex_setup = setup
+            .setup
+            .get(CODEX_RUNTIME_ID)
+            .cloned()
+            .unwrap_or_default();
+        assert!(!codex_setup.auth_ready);
+        assert!(!codex_setup.env.contains_key("GEMINI_API_KEY"));
+        assert_eq!(
+            secrets.stored_secret(CODEX_RUNTIME_ID, "GEMINI_API_KEY"),
+            None
+        );
+        let persisted = fs::read_to_string(&store_path).unwrap_or_default();
+        assert!(!persisted.contains("GEMINI_API_KEY"));
+        assert!(!persisted.contains("wrong-runtime-secret"));
+    }
+
+    #[test]
+    fn logout_removes_persisted_gemini_api_key_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GEMINI_RUNTIME_ID,
+                "input": {
+                    "gemini_api_key": {
+                        "action": "set",
+                        "value": "gemini-test-secret",
+                    },
+                    "google_api_key": {
+                        "action": "set",
+                        "value": "google-test-secret",
+                    },
+                },
+            }))
+            .unwrap();
+        assert!(store_path.exists());
+
+        native_ai
+            .logout(&json!({ "runtime_id": GEMINI_RUNTIME_ID }))
+            .unwrap();
+
+        assert!(!store_path.exists());
+        assert_eq!(
+            secrets
+                .get_secret(GEMINI_RUNTIME_ID, "GEMINI_API_KEY")
+                .expect("secret store should remain readable"),
+            None
+        );
+        assert_eq!(
+            secrets
+                .get_secret(GEMINI_RUNTIME_ID, "GOOGLE_API_KEY")
+                .expect("secret store should remain readable"),
+            None
+        );
+        let setup = native_ai.inner.lock().unwrap();
+        let gemini_setup = setup
+            .setup
+            .get(GEMINI_RUNTIME_ID)
+            .expect("Gemini setup entry should remain in memory");
+        assert!(!gemini_setup.env.contains_key("GEMINI_API_KEY"));
+        assert!(!gemini_setup.env.contains_key("GOOGLE_API_KEY"));
+        assert_eq!(gemini_setup.auth_method, None);
+        assert!(!gemini_setup.auth_ready);
+    }
+
+    #[test]
+    fn logout_secret_store_failure_does_not_commit_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path, secrets.clone());
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GEMINI_RUNTIME_ID,
+                "input": {
+                    "gemini_api_key": {
+                        "action": "set",
+                        "value": "gemini-test-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        secrets.fail_delete(true);
+        let error = native_ai
+            .logout(&json!({ "runtime_id": GEMINI_RUNTIME_ID }))
+            .expect_err("secret store delete failure should reject logout");
+
+        assert!(error.contains("test delete_secret failure"));
+        assert!(!error.contains("gemini-test-secret"));
+        assert_eq!(
+            secrets.stored_secret(GEMINI_RUNTIME_ID, "GEMINI_API_KEY"),
+            Some("gemini-test-secret".to_string())
+        );
+        let setup = native_ai.inner.lock().unwrap();
+        let gemini_setup = setup
+            .setup
+            .get(GEMINI_RUNTIME_ID)
+            .expect("Gemini setup should remain committed after failed logout");
+        assert!(gemini_setup.auth_ready);
+        assert_eq!(gemini_setup.auth_method.as_deref(), Some("use_gemini"));
+        assert_eq!(
+            gemini_setup.env.get("GEMINI_API_KEY").map(String::as_str),
+            Some("gemini-test-secret")
+        );
     }
 
     #[test]

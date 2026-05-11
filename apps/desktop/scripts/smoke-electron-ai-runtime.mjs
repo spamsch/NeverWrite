@@ -22,9 +22,18 @@ class SidecarClient {
   #eventWaiters = [];
   #stderr = "";
 
-  constructor(executablePath) {
+  constructor(executablePath, appDataDir) {
     this.#child = spawn(executablePath, [], {
       cwd: desktopRoot,
+      env: {
+        ...process.env,
+        NEVERWRITE_APP_DATA_DIR: appDataDir,
+        // Headless Linux CI does not provide a desktop keyring service. The
+        // smoke test opts into process-memory secrets while production remains
+        // backed by OS secure storage.
+        NEVERWRITE_AI_SECRET_STORE:
+          process.env.NEVERWRITE_AI_SECRET_STORE?.trim() || "memory",
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -316,12 +325,15 @@ async function main() {
   });
 
   const vaultPath = await fs.mkdtemp(path.join(os.tmpdir(), "neverwrite-ai-"));
+  const appDataDir = await fs.mkdtemp(
+    path.join(os.tmpdir(), "neverwrite-ai-app-data-"),
+  );
   const runtimeDir = await fs.mkdtemp(
     path.join(os.tmpdir(), "neverwrite-fake-acp-"),
   );
   const fakeAcpPath = await writeFakeAcpRuntime(runtimeDir);
   await writeFixtureVault(vaultPath);
-  const client = new SidecarClient(sidecarPath);
+  const client = new SidecarClient(sidecarPath, appDataDir);
 
   try {
     await client.invoke("start_open_vault", { path: vaultPath });
