@@ -39,15 +39,15 @@ async function measureCaretAtLine(
         const line = lines[nth - 1] as HTMLElement | undefined;
         if (!line) throw new Error(`line ${nth} not found (have ${lines.length})`);
 
-        const selection = window.getSelection();
-        if (!selection || selection.rangeCount === 0) {
-            throw new Error("no selection — editor is not focused");
-        }
-        const range = selection.getRangeAt(0).cloneRange();
-        range.collapse(true);
-        const rects = range.getClientRects();
-        const caretRect = rects[0] ?? range.getBoundingClientRect();
+        // With drawSelection() (matching the real editor), the caret is a
+        // CM-rendered .cm-cursor element inside .cm-cursorLayer rather than
+        // the native browser caret. Measure that.
+        const cursor = document.querySelector(
+            ".cm-cursorLayer .cm-cursor",
+        ) as HTMLElement | null;
+        if (!cursor) throw new Error("caret element not found");
 
+        const caretRect = cursor.getBoundingClientRect();
         const lineRect = line.getBoundingClientRect();
         const paddingLeft = parseFloat(
             window.getComputedStyle(line).paddingLeft,

@@ -1,6 +1,6 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { drawSelection, EditorView } from "@codemirror/view";
 
 import { linkReferenceField } from "../../src/features/editor/extensions/livePreviewHelpers";
 import { createInlineLivePreviewPlugin } from "../../src/features/editor/extensions/livePreviewInline";
@@ -43,6 +43,11 @@ window.mountEditor = ({ doc, selection }: MountOptions) => {
                 linkReferenceField,
                 createInlineLivePreviewPlugin(),
                 livePreviewTheme,
+                // The real editor (src/features/editor/Editor.tsx,
+                // FileTextTabView.tsx) uses drawSelection() so the caret is a
+                // CM-rendered element, not the native browser caret. Mirror
+                // that here so e2e measurements reflect what users see.
+                drawSelection(),
             ],
         }),
         parent,
