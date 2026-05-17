@@ -242,6 +242,44 @@ describe("createInlineLivePreviewPlugin", () => {
         parent.remove();
     });
 
+    // Regression coverage for jsgrrchg/NeverWrite#102.
+    // The live-preview line already reserves padding for indent + marker
+    // + gap, and the bullet is drawn as a CSS pseudo-element. The trailing
+    // source space after the marker must be collapsed too — otherwise it
+    // renders as a real character past the pseudo-bullet and pushes the
+    // caret one column away from the bullet, the artifact described in #102.
+    it("collapses the trailing marker space on an active empty top-level list item (#102)", () => {
+        const { plugin, parent, view } = createView(
+            "- ",
+            EditorSelection.cursor(2),
+        );
+
+        const decorations = collectDecorations(view, plugin);
+
+        expect(hasHiddenRange(decorations, 0, 2)).toBe(true);
+
+        view.destroy();
+        parent.remove();
+    });
+
+    it("collapses the trailing marker space on an active empty nested list item (#102)", () => {
+        const doc = "- parent\n    - ";
+        const { plugin, parent, view } = createView(
+            doc,
+            EditorSelection.cursor(doc.length),
+        );
+
+        const decorations = collectDecorations(view, plugin);
+
+        // Line 2 spans positions 9..15 ("    - "). The whole prefix should
+        // be hidden so the caret sits flush with the rendered bullet,
+        // matching the behaviour expected for top-level empty items.
+        expect(hasHiddenRange(decorations, 9, doc.length)).toBe(true);
+
+        view.destroy();
+        parent.remove();
+    });
+
     it("keeps task markers hidden even when the caret is on the same line", () => {
         const doc = "- [ ] task";
         const { plugin, parent, view } = createView(
