@@ -3,16 +3,29 @@ import { expect, test } from "@playwright/test";
 /**
  * Regression coverage for jsgrrchg/NeverWrite#102.
  *
- * Vitest pins the decoration-model cause (the trailing source space is not
- * collapsed for active empty list items). This spec pins the visual effect:
- * the caret must render at the line's content-box left, i.e. flush with the
- * pseudo-bullet + gap. If the trailing space leaks through, the caret lands
- * one character width past that point — exactly the artifact described in
- * the issue.
+ * Two visual properties must hold for an active empty list item:
+ *
+ *   1. Horizontal: the caret sits at the line's content-box left edge
+ *      (flush with the rendered pseudo-bullet + gap). If the trailing
+ *      source space leaks through, the caret drifts ~1ch past that.
+ *
+ *   2. Vertical / visibility: the caret has a non-zero rect. If the
+ *      line's source content is fully collapsed to font-size: 0 hidden
+ *      spans, the native caret's getClientRects() reports a 0x0 rect
+ *      and the caret is invisible — the secondary artifact reported by
+ *      @jsgrrchg when collapsing the trailing space without anchoring
+ *      the caret to a real editable glyph.
+ *
+ * Both assertions together catch:
+ *   - main today: caret is visible but ~9.6 px past content-box left.
+ *   - "collapse the full prefix" attempt: caret is at the right x but
+ *     has 0 height/width.
  */
 
 type CaretMeasurement = {
     cursorLeft: number;
+    cursorWidth: number;
+    cursorHeight: number;
     contentBoxLeft: number;
 };
 
@@ -40,10 +53,14 @@ async function measureCaret(
 
         return {
             cursorLeft: caretRect.left,
+            cursorWidth: caretRect.width,
+            cursorHeight: caretRect.height,
             contentBoxLeft: lineRect.left + paddingLeft,
         };
     }, lineSelector);
 }
+
+const MIN_CARET_HEIGHT_PX = 10; // anything below this is effectively invisible
 
 test.beforeEach(async ({ page }) => {
     await page.goto("/");
@@ -63,15 +80,13 @@ test("active empty top-level list item: caret sits flush with the bullet (#102)"
     await page.waitForSelector(".cm-lp-li-line");
     await page.locator(".cm-content").focus();
 
-    const { cursorLeft, contentBoxLeft } = await measureCaret(
+    const { cursorLeft, cursorHeight, contentBoxLeft } = await measureCaret(
         page,
         ".cm-lp-li-line",
     );
 
-    // The bullet pseudo-element ends at contentBoxLeft - marker-gap, so a
-    // correctly-anchored caret renders right at contentBoxLeft. The bug
-    // pushes the caret roughly one character width past that.
     expect(Math.abs(cursorLeft - contentBoxLeft)).toBeLessThan(2);
+    expect(cursorHeight).toBeGreaterThanOrEqual(MIN_CARET_HEIGHT_PX);
 });
 
 test("active empty nested list item: caret sits flush with the bullet (#102)", async ({
@@ -87,12 +102,13 @@ test("active empty nested list item: caret sits flush with the bullet (#102)", a
     const lineCount = await page.locator(".cm-lp-li-line").count();
     expect(lineCount).toBeGreaterThanOrEqual(2);
 
-    const { cursorLeft, contentBoxLeft } = await measureCaret(
+    const { cursorLeft, cursorHeight, contentBoxLeft } = await measureCaret(
         page,
         ".cm-lp-li-line:nth-of-type(2)",
     );
 
     expect(Math.abs(cursorLeft - contentBoxLeft)).toBeLessThan(2);
+    expect(cursorHeight).toBeGreaterThanOrEqual(MIN_CARET_HEIGHT_PX);
 });
 
 test("non-empty list item: caret sits flush with content (control)", async ({
@@ -105,13 +121,14 @@ test("non-empty list item: caret sits flush with content (control)", async ({
     await page.waitForSelector(".cm-lp-li-line");
     await page.locator(".cm-content").focus();
 
-    const { cursorLeft, contentBoxLeft } = await measureCaret(
+    const { cursorLeft, cursorHeight, contentBoxLeft } = await measureCaret(
         page,
         ".cm-lp-li-line",
     );
 
-    // For a 3-character content "abc" the caret should be ~3ch past the
-    // content-box left edge. Tolerance is generous; we just want to confirm
-    // the measurement infra works for the happy path.
+    // For a 3-character content "abc" the caret should be past the content-box
+    // left edge. Tolerance is generous; we just want to confirm the
+    // measurement infra works for the happy path.
     expect(cursorLeft).toBeGreaterThan(contentBoxLeft);
+    expect(cursorHeight).toBeGreaterThanOrEqual(MIN_CARET_HEIGHT_PX);
 });
