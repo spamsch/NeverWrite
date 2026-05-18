@@ -139,6 +139,31 @@ class InlineBreakWidget extends WidgetType {
     }
 }
 
+// Replaces the "- " / "    - " source on an active empty list item with a
+// zero-width inline span whose font-size is inherited. Width: 0 zeroes the
+// horizontal footprint so the caret sits flush with the bullet pseudo-element;
+// the inherited font-size keeps the line's intrinsic line-height intact so
+// drawSelection() can render a cursor element with non-zero height.
+class EmptyListLineAnchorWidget extends WidgetType {
+    toDOM() {
+        const span = document.createElement("span");
+        span.className = "cm-lp-empty-list-anchor";
+        span.appendChild(document.createTextNode(" "));
+        return span;
+    }
+    eq() {
+        return true;
+    }
+    ignoreEvent() {
+        return true;
+    }
+}
+
+const emptyListAnchorMark = Decoration.replace({
+    widget: new EmptyListLineAnchorWidget(),
+    inclusive: false,
+});
+
 function createMathMark(display: "inline" | "block") {
     return Decoration.mark({
         class: display === "block" ? "cm-lp-math-block" : "cm-lp-math-inline",
@@ -768,7 +793,15 @@ const listMarkRule: NodeRule = (node, context) => {
         line.to,
     );
 
-    hideRange(context, line.from, activeEmptyItem ? node.to : hideTo);
+    if (activeEmptyItem) {
+        // Replace the whole empty line ("- ", "    - ", "- [ ] " etc.) with
+        // a zero-width line-height anchor. Covering the full line ensures the
+        // caret at line.to does not land on a subsequent hide span (font-size:
+        // 0), which would otherwise collapse drawSelection's caret height.
+        pushDeco(context, line.from, line.to, emptyListAnchorMark);
+    } else {
+        hideRange(context, line.from, hideTo);
+    }
 
     if (isTaskItem) return;
 
@@ -923,7 +956,12 @@ const taskMarkerRule: NodeRule = (node, context) => {
         markerWidth: LIVE_PREVIEW_TASK_MARKER_WIDTH,
     });
 
-    hideRange(context, node.from, activeEmptyItem ? node.to : prefixEnd);
+    // listMarkRule already replaces the whole line with a line-height anchor
+    // for active empty items; skip adding the task-marker hide on top of it,
+    // since overlapping mark+replace would either be redundant or compete.
+    if (!activeEmptyItem) {
+        hideRange(context, node.from, prefixEnd);
+    }
     addLineDecoration(
         context.lineDecos,
         line.from,

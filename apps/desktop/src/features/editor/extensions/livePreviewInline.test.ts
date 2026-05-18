@@ -223,7 +223,12 @@ describe("createInlineLivePreviewPlugin", () => {
         parent.remove();
     });
 
-    it("keeps an active empty list item in live preview without showing raw markers", () => {
+    // Regression coverage for jsgrrchg/NeverWrite#102.
+    // For an active empty list item, the whole line is replaced with the
+    // empty-list line-height anchor widget so the caret sits flush with the
+    // pseudo-bullet AND keeps its natural height (the widget's text node
+    // contributes line-height, which drawSelection() needs).
+    it("replaces an active empty top-level list line with the anchor widget (#102)", () => {
         const { plugin, parent, view } = createView(
             "- ",
             EditorSelection.cursor(2),
@@ -231,7 +236,7 @@ describe("createInlineLivePreviewPlugin", () => {
 
         const decorations = collectDecorations(view, plugin);
 
-        expect(hasHiddenRange(decorations, 0, 1)).toBe(true);
+        expect(hasWidgetRange(decorations, 0, 2)).toBe(true);
         expect(
             decorations.some((deco) =>
                 deco.className.split(" ").includes("cm-lp-li-line"),
@@ -242,27 +247,7 @@ describe("createInlineLivePreviewPlugin", () => {
         parent.remove();
     });
 
-    // Regression coverage for jsgrrchg/NeverWrite#102.
-    // The live-preview line already reserves padding for indent + marker
-    // + gap, and the bullet is drawn as a CSS pseudo-element. The trailing
-    // source space after the marker must be collapsed too — otherwise it
-    // renders as a real character past the pseudo-bullet and pushes the
-    // caret one column away from the bullet, the artifact described in #102.
-    it("collapses the trailing marker space on an active empty top-level list item (#102)", () => {
-        const { plugin, parent, view } = createView(
-            "- ",
-            EditorSelection.cursor(2),
-        );
-
-        const decorations = collectDecorations(view, plugin);
-
-        expect(hasHiddenRange(decorations, 0, 2)).toBe(true);
-
-        view.destroy();
-        parent.remove();
-    });
-
-    it("collapses the trailing marker space on an active empty nested list item (#102)", () => {
+    it("replaces an active empty nested list line with the anchor widget (#102)", () => {
         const doc = "- parent\n    - ";
         const { plugin, parent, view } = createView(
             doc,
@@ -271,10 +256,10 @@ describe("createInlineLivePreviewPlugin", () => {
 
         const decorations = collectDecorations(view, plugin);
 
-        // Line 2 spans positions 9..15 ("    - "). The whole prefix should
-        // be hidden so the caret sits flush with the rendered bullet,
-        // matching the behaviour expected for top-level empty items.
-        expect(hasHiddenRange(decorations, 9, doc.length)).toBe(true);
+        // Line 2 spans positions 9..15 ("    - "); the whole line is
+        // replaced so the caret anchors flush with the rendered bullet at
+        // the nested indent level.
+        expect(hasWidgetRange(decorations, 9, doc.length)).toBe(true);
 
         view.destroy();
         parent.remove();
@@ -381,7 +366,7 @@ describe("createInlineLivePreviewPlugin", () => {
         parent.remove();
     });
 
-    it("keeps an active empty task item in live preview without showing raw markers", () => {
+    it("replaces an active empty task line with the anchor widget (#102)", () => {
         const doc = "- [ ] ";
         const { plugin, parent, view } = createView(
             doc,
@@ -390,8 +375,7 @@ describe("createInlineLivePreviewPlugin", () => {
 
         const decorations = collectDecorations(view, plugin);
 
-        expect(hasHiddenRange(decorations, 0, 1)).toBe(true);
-        expect(hasHiddenRange(decorations, 2, 5)).toBe(true);
+        expect(hasWidgetRange(decorations, 0, doc.length)).toBe(true);
         expect(
             decorations.some((deco) =>
                 deco.className.split(" ").includes("cm-lp-task-line"),

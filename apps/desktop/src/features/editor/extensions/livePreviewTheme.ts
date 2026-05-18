@@ -32,6 +32,15 @@ export const livePreviewTheme = EditorView.baseTheme({
         overflow: "hidden",
         opacity: "0",
     },
+    // Empty-list line anchor: width 0 (no horizontal footprint) but font-size
+    // is inherited so the parent line keeps its natural line-height, which
+    // drawSelection() needs in order to render the caret at full height.
+    ".cm-lp-empty-list-anchor": {
+        display: "inline-block",
+        letterSpacing: "0",
+        width: "0",
+        overflow: "hidden",
+    },
     ".cm-lp-h1": {
         fontSize: "1.8em",
         fontWeight: "700",
