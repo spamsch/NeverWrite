@@ -2737,6 +2737,7 @@ export function FileTree() {
 
     useEffect(() => {
         const handler = (event: Event) => {
+            if (dragStateRef.current) return;
             const { phase, folderPath } = (
                 event as CustomEvent<ExternalFileTreeDragDetail>
             ).detail;

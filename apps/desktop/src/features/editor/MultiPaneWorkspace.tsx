@@ -25,6 +25,7 @@ import {
     type FileTreeNoteDragDetail,
 } from "../ai/dragEvents";
 import { vaultInvoke } from "../../app/utils/vaultInvoke";
+import { logError } from "../../app/utils/runtimeLog";
 import {
     AGENT_SIDEBAR_DRAG_EVENT,
     type AgentSidebarDragDetail,
@@ -58,7 +59,7 @@ async function copyExternalFilesToVaultFolder(
     sourcePaths: string[],
     targetFolder: string,
 ) {
-    await Promise.all(
+    const results = await Promise.allSettled(
         sourcePaths.map((sourcePath) =>
             vaultInvoke("copy_external_file_to_vault", {
                 sourcePath,
@@ -66,6 +67,16 @@ async function copyExternalFilesToVaultFolder(
             }),
         ),
     );
+    for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        if (result?.status === "rejected") {
+            logError(
+                "file-tree",
+                `Failed to copy file into vault: ${sourcePaths[i]}`,
+                result.reason,
+            );
+        }
+    }
 }
 
 function getAppWindow() {
