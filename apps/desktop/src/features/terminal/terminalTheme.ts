@@ -45,6 +45,12 @@ export function getTerminalTheme(
     );
     const v = (name: string) => computed.getPropertyValue(name).trim();
 
+    // Read a terminal ANSI slot: prefer the per-theme custom property set by
+    // applyTerminalPalette(), fall back to the Catppuccin icon token which is
+    // always present and provides a reasonable default for unlisted themes.
+    const ansi = (cssVar: string, fallback: string) =>
+        v(cssVar) || v(fallback);
+
     return {
         background: v("--bg-primary"),
         panelBackground: v("--bg-secondary"),
@@ -56,24 +62,22 @@ export function getTerminalTheme(
         fontFamily: opts?.fontFamily?.trim() || FALLBACK_FONT_STACK,
         fontSize: opts?.fontSize ?? 13,
         lineHeight: 1.4,
-        // ANSI palette derived from Catppuccin icon tokens (defined for both
-        // light and dark themes) — gives consistent, intentional colours.
-        black: v("--bg-secondary"),
-        red: v("--catppuccin-icon-red"),
-        green: v("--catppuccin-icon-green"),
-        yellow: v("--catppuccin-icon-yellow"),
-        blue: v("--catppuccin-icon-blue"),
-        magenta: v("--catppuccin-icon-mauve"),
-        cyan: v("--catppuccin-icon-teal"),
-        white: v("--text-primary"),
-        brightBlack: v("--text-secondary"),
-        brightRed: v("--catppuccin-icon-maroon"),
-        brightGreen: v("--catppuccin-icon-green"),
-        brightYellow: v("--catppuccin-icon-peach"),
-        brightBlue: v("--catppuccin-icon-lavender"),
-        brightMagenta: v("--catppuccin-icon-pink"),
-        brightCyan: v("--catppuccin-icon-sky"),
-        brightWhite: v("--text-heading"),
+        black:         ansi("--terminal-ansi-black",          "--bg-secondary"),
+        red:           ansi("--terminal-ansi-red",            "--catppuccin-icon-red"),
+        green:         ansi("--terminal-ansi-green",          "--catppuccin-icon-green"),
+        yellow:        ansi("--terminal-ansi-yellow",         "--catppuccin-icon-yellow"),
+        blue:          ansi("--terminal-ansi-blue",           "--catppuccin-icon-blue"),
+        magenta:       ansi("--terminal-ansi-magenta",        "--catppuccin-icon-mauve"),
+        cyan:          ansi("--terminal-ansi-cyan",           "--catppuccin-icon-teal"),
+        white:         ansi("--terminal-ansi-white",          "--text-primary"),
+        brightBlack:   ansi("--terminal-ansi-bright-black",   "--text-secondary"),
+        brightRed:     ansi("--terminal-ansi-bright-red",     "--catppuccin-icon-maroon"),
+        brightGreen:   ansi("--terminal-ansi-bright-green",   "--catppuccin-icon-green"),
+        brightYellow:  ansi("--terminal-ansi-bright-yellow",  "--catppuccin-icon-peach"),
+        brightBlue:    ansi("--terminal-ansi-bright-blue",    "--catppuccin-icon-lavender"),
+        brightMagenta: ansi("--terminal-ansi-bright-magenta", "--catppuccin-icon-pink"),
+        brightCyan:    ansi("--terminal-ansi-bright-cyan",    "--catppuccin-icon-sky"),
+        brightWhite:   ansi("--terminal-ansi-bright-white",   "--text-heading"),
         selectionBackground: v("--highlight-bg"),
         scrollbarSliderBackground: v("--scrollbar-thumb-active"),
         scrollbarSliderHoverBackground: v("--scrollbar-thumb-hover"),

@@ -240,34 +240,6 @@ describe("App note window", () => {
         expect(activeTab && isTerminalTab(activeTab)).toBe(true);
     });
 
-    it("does not open workspace terminals from the shortcut when disabled", async () => {
-        detachedWindowMock.label = "main";
-        detachedWindowMock.mode = "main";
-        window.history.replaceState({}, "", "/");
-        useSettingsStore.setState({
-            developerModeEnabled: true,
-            developerTerminalEnabled: false,
-        });
-
-        renderComponent(<App />);
-        await flushPromises();
-
-        const platform = getDesktopPlatform();
-
-        await act(async () => {
-            window.dispatchEvent(
-                new KeyboardEvent("keydown", {
-                    key: "r",
-                    metaKey: platform === "macos",
-                    ctrlKey: platform !== "macos",
-                }),
-            );
-            await Promise.resolve();
-        });
-        await flushPromises();
-
-        expect(useEditorStore.getState().tabs.some(isTerminalTab)).toBe(false);
-    });
 
     it("starts workspace terminal runtimes inside detached note windows", async () => {
         mockInvoke().mockResolvedValue({

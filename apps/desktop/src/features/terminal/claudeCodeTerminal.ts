@@ -61,14 +61,12 @@ function resolveCdTarget(
 
 function waitForTerminalRunning(terminalId: string): Promise<boolean> {
     return new Promise((resolve) => {
-        let intervalId: ReturnType<typeof setInterval>;
-
         const timeoutId = setTimeout(() => {
             clearInterval(intervalId);
             resolve(false);
         }, TERMINAL_READY_TIMEOUT_MS);
 
-        intervalId = setInterval(() => {
+        const intervalId = setInterval(() => {
             const status =
                 useTerminalRuntimeStore.getState().runtimesById[terminalId]
                     ?.snapshot.status;
