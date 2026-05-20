@@ -9,13 +9,19 @@ import { useVaultStore } from "../../app/store/vaultStore";
 import type { FileTreeNoteDragDetail } from "../ai/dragEvents";
 import { useTerminalRuntimeStore } from "./terminalRuntimeStore";
 
+// Module-level cache so chatStore, AIProvidersSettings, and TerminalSettings
+// all share one shell spawn rather than each issuing their own.
+let _binaryCheckCache: boolean | null = null;
+
 export async function checkClaudeCodeInstalled(): Promise<boolean> {
+    if (_binaryCheckCache !== null) return _binaryCheckCache;
     try {
         const result = await invoke<{ found: boolean }>(
             "devtools_check_binary",
             { name: "claude" },
         );
-        return result.found;
+        _binaryCheckCache = result.found;
+        return _binaryCheckCache;
     } catch {
         return false;
     }
@@ -23,8 +29,11 @@ export async function checkClaudeCodeInstalled(): Promise<boolean> {
 
 // Milliseconds to wait for the terminal PTY to reach "running" state.
 const TERMINAL_READY_TIMEOUT_MS = 10_000;
-// Milliseconds to wait for Claude Code's TUI to initialise before pre-filling.
-const CLAUDE_TUI_SETTLE_MS = 2_000;
+// Fixed delay waiting for Claude Code's TUI to finish initialising. This is a
+// best-effort heuristic — a cold start (first auth, slow disk) can take longer.
+// A proper fix would watch rawOutput for a stable ready marker, but that depends
+// on Claude Code's output format staying stable across versions.
+const CLAUDE_TUI_SETTLE_MS = 3_500;
 
 // Quote a path for a Claude Code @mention. Use double quotes around any path
 // that contains characters outside the safe unquoted set so the mention parser
@@ -75,25 +84,39 @@ function resolveCdTarget(
 
 function waitForTerminalRunning(terminalId: string): Promise<boolean> {
     return new Promise((resolve) => {
-        const timeoutId = setTimeout(() => {
-            clearInterval(intervalId);
-            resolve(false);
-        }, TERMINAL_READY_TIMEOUT_MS);
-
-        const intervalId = setInterval(() => {
+        const check = (): "ready" | "failed" | null => {
             const status =
                 useTerminalRuntimeStore.getState().runtimesById[terminalId]
                     ?.snapshot.status;
-            if (status === "running") {
-                clearTimeout(timeoutId);
-                clearInterval(intervalId);
-                resolve(true);
-            } else if (status === "error" || status === "exited") {
-                clearTimeout(timeoutId);
-                clearInterval(intervalId);
-                resolve(false);
+            if (status === "running") return "ready";
+            if (status === "error" || status === "exited") return "failed";
+            return null;
+        };
+
+        // Check synchronously first to avoid missing a transition that
+        // already happened between openTerminal() and subscribe().
+        const immediate = check();
+        if (immediate !== null) {
+            resolve(immediate === "ready");
+            return;
+        }
+
+        const deadline = setTimeout(() => {
+            unsub();
+            console.warn(
+                `[terminal] Timed out waiting for terminal ${terminalId} to start`,
+            );
+            resolve(false);
+        }, TERMINAL_READY_TIMEOUT_MS);
+
+        const unsub = useTerminalRuntimeStore.subscribe(() => {
+            const result = check();
+            if (result !== null) {
+                clearTimeout(deadline);
+                unsub();
+                resolve(result === "ready");
             }
-        }, 100);
+        });
     });
 }
 

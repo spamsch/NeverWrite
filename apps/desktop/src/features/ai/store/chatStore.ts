@@ -150,36 +150,11 @@ import {
 } from "../../../app/utils/safeStorage";
 import { logDebug, logError, logWarn } from "../../../app/utils/runtimeLog";
 import { CLAUDE_TERMINAL_RUNTIME_ID } from "../utils/runtimeMetadata";
+import {
+    CLAUDE_TERMINAL_DESCRIPTOR,
+    buildClaudeTerminalSetupStatus,
+} from "../utils/claudeTerminalRuntime";
 import { checkClaudeCodeInstalled } from "../../terminal/claudeCodeTerminal";
-
-const CLAUDE_TERMINAL_DESCRIPTOR = {
-    runtime: {
-        id: CLAUDE_TERMINAL_RUNTIME_ID,
-        name: "Claude Code",
-        description:
-            "Claude Code CLI running in an integrated terminal tab.",
-        capabilities: ["attachments"] as string[],
-    },
-    models: [] as never[],
-    modes: [] as never[],
-    configOptions: [] as never[],
-} satisfies import("../types").AIRuntimeDescriptor;
-
-function buildClaudeTerminalSetupStatus(
-    binaryFound: boolean,
-): import("../types").AIRuntimeSetupStatus {
-    return {
-        runtimeId: CLAUDE_TERMINAL_RUNTIME_ID,
-        binaryReady: binaryFound,
-        binarySource: "env" as const,
-        authReady: binaryFound,
-        authMethods: [] as never[],
-        onboardingRequired: false,
-        message: binaryFound
-            ? undefined
-            : 'claude not found in PATH. Install via: npm install -g @anthropic-ai/claude-code',
-    };
-}
 
 const AI_PREFS_KEY = "neverwrite.ai.preferences";
 const AI_RUNTIME_CACHE_KEY = "neverwrite.ai.runtime-catalog";
@@ -6507,6 +6482,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     persistedRuntimeId ??
                     (claudeFound ? CLAUDE_TERMINAL_RUNTIME_ID : null) ??
                     getDefaultRuntimeId(runtimes, setupStatusByRuntimeId);
+
+                // Persist Claude Code as the default when it was auto-selected
+                // (binary found, no prior explicit choice) so the pick is stable
+                // across launches — binary removal won't silently flip it.
+                if (
+                    !persistedRuntimeId &&
+                    defaultRuntimeId === CLAUDE_TERMINAL_RUNTIME_ID
+                ) {
+                    saveAiPreferences({ defaultRuntimeId });
+                }
 
                 set({
                     runtimes,

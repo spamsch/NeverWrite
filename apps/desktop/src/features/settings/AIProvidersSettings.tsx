@@ -20,6 +20,10 @@ import {
     getRuntimeDisplayName,
     PROVIDER_CATALOG,
 } from "../ai/utils/runtimeMetadata";
+import {
+    CLAUDE_TERMINAL_DESCRIPTOR,
+    buildClaudeTerminalSetupStatus,
+} from "../ai/utils/claudeTerminalRuntime";
 import { checkClaudeCodeInstalled } from "../terminal/claudeCodeTerminal";
 import { useChatStore } from "../ai/store/chatStore";
 import { getClaudeGatewayUrlValidationMessage } from "../ai/utils/claudeGatewayUrl";
@@ -925,33 +929,13 @@ export function AIProvidersSettings({
                 const claudeFound = await checkClaudeCodeInstalled();
                 if (cancelled) return;
 
-                const claudeDescriptor: AIRuntimeDescriptor = {
-                    runtime: {
-                        id: CLAUDE_TERMINAL_RUNTIME_ID,
-                        name: "Claude Code",
-                        description: "Claude Code CLI in an integrated terminal.",
-                        capabilities: ["attachments"],
-                    },
-                    models: [],
-                    modes: [],
-                    configOptions: [],
-                };
-                statuses[CLAUDE_TERMINAL_RUNTIME_ID] = {
-                    runtimeId: CLAUDE_TERMINAL_RUNTIME_ID,
-                    binaryReady: claudeFound,
-                    binarySource: "env",
-                    authReady: claudeFound,
-                    authMethods: [],
-                    onboardingRequired: false,
-                    message: claudeFound
-                        ? undefined
-                        : "claude not found. Run: npm install -g @anthropic-ai/claude-code",
-                };
+                statuses[CLAUDE_TERMINAL_RUNTIME_ID] =
+                    buildClaudeTerminalSetupStatus(claudeFound);
 
                 // Only include Claude Code in the INSTALLED list if the binary is
                 // present; otherwise it will appear in ALL with an Install button.
                 const allDescriptors = claudeFound
-                    ? [...descriptors, claudeDescriptor]
+                    ? [...descriptors, CLAUDE_TERMINAL_DESCRIPTOR]
                     : descriptors;
 
                 setRuntimes(allDescriptors);
