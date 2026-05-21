@@ -5044,6 +5044,10 @@ function isRuntimeSetupReady(setupStatus?: AIRuntimeSetupStatus | null) {
     return setupStatus?.authReady === true && !setupStatus.onboardingRequired;
 }
 
+function isClaudeTerminalRuntimeId(runtimeId?: string | null) {
+    return runtimeId === CLAUDE_TERMINAL_RUNTIME_ID;
+}
+
 function getDefaultRuntimeId(
     runtimes: AIRuntimeDescriptor[],
     setupStatusByRuntimeId?: Record<string, AIRuntimeSetupStatus>,
@@ -5057,6 +5061,18 @@ function getDefaultRuntimeId(
         : null;
 
     return readyRuntime?.runtime.id ?? runtimes[0]?.runtime.id ?? null;
+}
+
+function getImplicitDefaultAcpRuntimeId(
+    runtimes: AIRuntimeDescriptor[],
+    setupStatusByRuntimeId?: Record<string, AIRuntimeSetupStatus>,
+) {
+    return getDefaultRuntimeId(
+        runtimes.filter(
+            (runtime) => !isClaudeTerminalRuntimeId(runtime.runtime.id),
+        ),
+        setupStatusByRuntimeId,
+    );
 }
 
 function runtimeSupportsCapability(
@@ -6406,19 +6422,19 @@ export const useChatStore = create<ChatStore>((set, get) => {
         },
 
         getDefaultNewChatRuntimeId: () => {
-            // Reads the user's persisted explicit choice. Falls back to
-            // Claude Code if the binary is available and no explicit override
-            // was set. Uses prefs directly so the active session's runtime
-            // (which drives selectedRuntimeId) can't shadow this.
+            // Reads the user's persisted explicit choice first. Claude Code is
+            // a terminal pseudo-runtime, so detection alone must not promote it
+            // over ACP runtimes for new chats.
             const explicit = loadAiPreferences().defaultRuntimeId ?? null;
             if (explicit !== null) return explicit;
-            const { setupStatusByRuntimeId } = get();
-            if (
-                setupStatusByRuntimeId[CLAUDE_TERMINAL_RUNTIME_ID]?.authReady
-            ) {
-                return CLAUDE_TERMINAL_RUNTIME_ID;
-            }
-            return get().selectedRuntimeId;
+            const state = get();
+            return (
+                state.selectedRuntimeId ??
+                getImplicitDefaultAcpRuntimeId(
+                    state.runtimes,
+                    state.setupStatusByRuntimeId,
+                )
+            );
         },
 
         initialize: async (options) => {
@@ -6473,25 +6489,17 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     [CLAUDE_TERMINAL_RUNTIME_ID]:
                         buildClaudeTerminalSetupStatus(claudeFound),
                 };
-                // Persisted explicit selection wins. Otherwise auto-default to
-                // Claude Code if found in PATH, falling back to first ready ACP
-                // runtime.
+                // Persisted explicit selection wins. Otherwise stay on ACP
+                // runtimes; Claude Code remains available but is not promoted
+                // to the default just because the binary exists in PATH.
                 const persistedRuntimeId =
                     loadAiPreferences().defaultRuntimeId ?? null;
                 const defaultRuntimeId =
                     persistedRuntimeId ??
-                    (claudeFound ? CLAUDE_TERMINAL_RUNTIME_ID : null) ??
-                    getDefaultRuntimeId(runtimes, setupStatusByRuntimeId);
-
-                // Persist Claude Code as the default when it was auto-selected
-                // (binary found, no prior explicit choice) so the pick is stable
-                // across launches — binary removal won't silently flip it.
-                if (
-                    !persistedRuntimeId &&
-                    defaultRuntimeId === CLAUDE_TERMINAL_RUNTIME_ID
-                ) {
-                    saveAiPreferences({ defaultRuntimeId });
-                }
+                    getImplicitDefaultAcpRuntimeId(
+                        runtimes,
+                        setupStatusByRuntimeId,
+                    );
 
                 set({
                     runtimes,

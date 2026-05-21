@@ -479,7 +479,11 @@ describe("createNewChatInWorkspace", () => {
         expect(selectEditorWorkspaceTabs(useEditorStore.getState())).toEqual([]);
     });
 
-    it("does not create an ACP chat when the default runtime is Claude Code terminal", async () => {
+    it("does not create an ACP chat when Claude Code terminal is the explicit default runtime", async () => {
+        localStorage.setItem(
+            AI_PREFS_KEY,
+            JSON.stringify({ defaultRuntimeId: CLAUDE_TERMINAL_RUNTIME_ID }),
+        );
         useChatStore.setState((state) => ({
             ...state,
             runtimes: [runtimeDescriptor, claudeTerminalRuntimeDescriptor],

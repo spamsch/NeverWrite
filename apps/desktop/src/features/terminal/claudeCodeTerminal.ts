@@ -27,6 +27,10 @@ export async function checkClaudeCodeInstalled(): Promise<boolean> {
     }
 }
 
+export function resetClaudeCodeInstalledCacheForTests() {
+    _binaryCheckCache = null;
+}
+
 // Milliseconds to wait for the terminal PTY to reach "running" state.
 const TERMINAL_READY_TIMEOUT_MS = 10_000;
 // Fixed delay waiting for Claude Code's TUI to finish initialising. This is a
