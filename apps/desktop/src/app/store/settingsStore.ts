@@ -35,11 +35,19 @@ export interface Settings {
     fileTreeStickyFolders: boolean;
     tabOpenBehavior: TabOpenBehavior;
 
+    // Terminal
+    terminalFontFamily: string;
+    terminalFontSize: number; // 8–24
+    claudeCodeOptimized: boolean;
+    claudeCodeSkipPermissions: boolean;
+    claudeCodeModel: string; // "" = Claude Code default
+    claudeCodeContinueSession: boolean;
+    claudeCodeMaxTurns: number; // 0 = unlimited
+
     // Developers
-    developerModeEnabled: boolean;
-    developerTerminalEnabled: boolean;
     fileTreeContentMode: "notes_only" | "all_files";
     fileTreeShowExtensions: boolean;
+    fileTreeExtensionFilter: string[];
 }
 
 interface SettingsStore extends Settings {
@@ -63,6 +71,7 @@ export type EditorFontFamily =
     | "source-serif"
     | "mono"
     | "jetbrains"
+    | "fliege-mono"
     | "geist-mono"
     | "ibm-plex-mono"
     | "courier"
@@ -92,6 +101,7 @@ const VALID_EDITOR_FONT_FAMILIES: EditorFontFamily[] = [
     "source-serif",
     "mono",
     "jetbrains",
+    "fliege-mono",
     "geist-mono",
     "ibm-plex-mono",
     "courier",
@@ -142,6 +152,7 @@ export const EDITOR_FONT_FAMILY_OPTIONS: {
     { value: "slab", label: "Rockwell Slab", group: "Serif" },
     { value: "mono", label: "Monospace (JetBrains)", group: "Mono" },
     { value: "jetbrains", label: "JetBrains Mono", group: "Mono" },
+    { value: "fliege-mono", label: "Fliege Mono", group: "Mono" },
     { value: "geist-mono", label: "Geist Mono", group: "Mono" },
     { value: "ibm-plex-mono", label: "IBM Plex Mono", group: "Mono" },
     { value: "courier", label: "Courier New", group: "Mono" },
@@ -171,16 +182,40 @@ const defaults: Settings = {
     agentsSidebarScale: 100,
     fileTreeStickyFolders: true,
     tabOpenBehavior: "history",
-    developerModeEnabled: false,
-    developerTerminalEnabled: true,
+    terminalFontFamily: "",
+    terminalFontSize: 13,
+    claudeCodeOptimized: false,
+    claudeCodeSkipPermissions: false,
+    claudeCodeModel: "",
+    claudeCodeContinueSession: false,
+    claudeCodeMaxTurns: 0,
     fileTreeContentMode: "notes_only",
     fileTreeShowExtensions: false,
+    fileTreeExtensionFilter: [],
 };
 
 function normalizeFileTreeContentMode(
     value: unknown,
 ): Settings["fileTreeContentMode"] {
     return value === "all_files" ? "all_files" : "notes_only";
+}
+
+function normalizeFileTreeExtensionFilter(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const item of value) {
+        if (typeof item !== "string") continue;
+        const extension = item.trim().replace(/^\.+/, "").toLowerCase();
+        if (!extension || seen.has(extension)) continue;
+        seen.add(extension);
+        normalized.push(extension);
+    }
+
+    return normalized;
 }
 
 function normalizeTabOpenBehavior(value: unknown): TabOpenBehavior {
@@ -385,18 +420,44 @@ function extractSettingsFromStorage(raw: string | null): Settings | null {
             tabOpenBehavior: normalizeTabOpenBehavior(
                 parsed.state.tabOpenBehavior,
             ),
-            developerModeEnabled:
-                parsed.state.developerModeEnabled ??
-                defaults.developerModeEnabled,
-            developerTerminalEnabled:
-                parsed.state.developerTerminalEnabled ??
-                defaults.developerTerminalEnabled,
+            terminalFontFamily:
+                typeof parsed.state.terminalFontFamily === "string"
+                    ? parsed.state.terminalFontFamily
+                    : defaults.terminalFontFamily,
+            terminalFontSize: normalizeIntInRange(
+                parsed.state.terminalFontSize,
+                defaults.terminalFontSize,
+                8,
+                24,
+            ),
+            claudeCodeOptimized:
+                parsed.state.claudeCodeOptimized ??
+                defaults.claudeCodeOptimized,
+            claudeCodeSkipPermissions:
+                parsed.state.claudeCodeSkipPermissions ??
+                defaults.claudeCodeSkipPermissions,
+            claudeCodeModel:
+                typeof parsed.state.claudeCodeModel === "string"
+                    ? parsed.state.claudeCodeModel
+                    : defaults.claudeCodeModel,
+            claudeCodeContinueSession:
+                parsed.state.claudeCodeContinueSession ??
+                defaults.claudeCodeContinueSession,
+            claudeCodeMaxTurns: normalizeIntInRange(
+                parsed.state.claudeCodeMaxTurns,
+                defaults.claudeCodeMaxTurns,
+                0,
+                1000,
+            ),
             fileTreeContentMode: normalizeFileTreeContentMode(
                 parsed.state.fileTreeContentMode,
             ),
             fileTreeShowExtensions:
                 parsed.state.fileTreeShowExtensions ??
                 defaults.fileTreeShowExtensions,
+            fileTreeExtensionFilter: normalizeFileTreeExtensionFilter(
+                parsed.state.fileTreeExtensionFilter,
+            ),
         };
     } catch {
         return null;
@@ -459,10 +520,16 @@ function pickSettings(state: SettingsStore): Settings {
         agentsSidebarScale: state.agentsSidebarScale,
         fileTreeStickyFolders: state.fileTreeStickyFolders,
         tabOpenBehavior: state.tabOpenBehavior,
-        developerModeEnabled: state.developerModeEnabled,
-        developerTerminalEnabled: state.developerTerminalEnabled,
+        terminalFontFamily: state.terminalFontFamily,
+        terminalFontSize: state.terminalFontSize,
+        claudeCodeOptimized: state.claudeCodeOptimized,
+        claudeCodeSkipPermissions: state.claudeCodeSkipPermissions,
+        claudeCodeModel: state.claudeCodeModel,
+        claudeCodeContinueSession: state.claudeCodeContinueSession,
+        claudeCodeMaxTurns: state.claudeCodeMaxTurns,
         fileTreeContentMode: state.fileTreeContentMode,
         fileTreeShowExtensions: state.fileTreeShowExtensions,
+        fileTreeExtensionFilter: state.fileTreeExtensionFilter,
     };
 }
 
@@ -598,6 +665,13 @@ export const useSettingsStore = create<SettingsStore>()((set) => ({
                     spellcheckPrimaryLanguage: nextPair.primary,
                     spellcheckSecondaryLanguage: nextPair.secondary,
                 } as Partial<Settings>;
+            }
+
+            if (key === "fileTreeExtensionFilter") {
+                return {
+                    fileTreeExtensionFilter:
+                        normalizeFileTreeExtensionFilter(value),
+                };
             }
 
             return { [key]: value } as Partial<Settings>;

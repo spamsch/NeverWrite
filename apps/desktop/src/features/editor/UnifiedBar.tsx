@@ -167,12 +167,6 @@ export function UnifiedBar({ windowMode }: UnifiedBarProps) {
         (s) => s.navigateToHistoryIndex,
     );
     const tabOpenBehavior = useSettingsStore((s) => s.tabOpenBehavior);
-    const developerModeEnabled = useSettingsStore(
-        (s) => s.developerModeEnabled,
-    );
-    const developerTerminalEnabled = useSettingsStore(
-        (s) => s.developerTerminalEnabled,
-    );
     const fileTreeShowExtensions = useSettingsStore(
         (s) => s.fileTreeShowExtensions,
     );
@@ -1380,6 +1374,10 @@ export function UnifiedBar({ windowMode }: UnifiedBarProps) {
                                                         style={{
                                                             width: tabLayout.closeButtonSize,
                                                             height: tabLayout.closeButtonSize,
+                                                            // Eat into the tab's right padding so the
+                                                            // close button sits closer to the right edge
+                                                            // without losing its clickable area.
+                                                            marginRight: -6,
                                                         }}
                                                     >
                                                         <svg
@@ -1776,8 +1774,6 @@ export function UnifiedBar({ windowMode }: UnifiedBarProps) {
                     onClose={() => setNewTabContextMenu(null)}
                     entries={buildNewTabContextMenuEntries({
                         paneId: focusedPaneId ?? undefined,
-                        developerModeEnabled,
-                        developerTerminalEnabled,
                     })}
                 />
             )}

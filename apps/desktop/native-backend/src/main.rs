@@ -893,7 +893,8 @@ impl NativeBackend {
             | "devtools_resize_terminal_session"
             | "devtools_restart_terminal_session"
             | "devtools_close_terminal_session"
-            | "devtools_get_terminal_session_snapshot" => self.devtools.invoke(command, args),
+            | "devtools_get_terminal_session_snapshot"
+            | "devtools_check_binary" => self.devtools.invoke(command, args),
             "spellcheck_list_languages"
             | "spellcheck_list_catalog"
             | "spellcheck_check_text"
@@ -1820,7 +1821,11 @@ impl NativeBackend {
         )
         .map_err(|error| error.to_string())?;
         let state = self.state(&args)?;
-        Ok(json!(state.index.advanced_search(&params, &state.vault)))
+        Ok(json!(state.index.advanced_search(
+            &params,
+            &state.vault,
+            &state.entries
+        )))
     }
 
     fn get_graph_snapshot(&mut self, args: Value) -> Result<Value, String> {

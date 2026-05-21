@@ -15,6 +15,8 @@ import { OutlinePanel } from "./features/notes/OutlinePanel";
 import { AIChatWorkspaceHost } from "./features/ai/AIChatWorkspaceHost";
 import { AIChatDetachedWindowHost } from "./features/ai/AIChatDetachedWindowHost";
 import { createNewChatInWorkspace } from "./features/ai/chatPaneMovement";
+import { CLAUDE_TERMINAL_RUNTIME_ID } from "./features/ai/utils/runtimeMetadata";
+import { openClaudeCodeTerminalWithContext } from "./features/terminal/claudeCodeTerminal";
 import { WorkspaceTerminalHost } from "./features/terminal/WorkspaceTerminalHost";
 import { migrateLegacyTerminalTabsToWorkspace } from "./features/terminal/legacyTerminalMigration";
 import { UnifiedBar } from "./features/editor/UnifiedBar";
@@ -550,6 +552,7 @@ function useRegisterCommands(
         const openVaultShortcut = getShortcutDefinition("open_vault");
         const newNoteShortcut = getShortcutDefinition("new_note");
         const newAgentShortcut = getShortcutDefinition("new_agent");
+        const newTerminalShortcut = getShortcutDefinition("new_terminal");
         const closeTabShortcut = getShortcutDefinition("close_tab");
         const newTabShortcut = getShortcutDefinition("new_tab");
         const reopenClosedTabShortcut =
@@ -587,16 +590,12 @@ function useRegisterCommands(
                 ? selectPaneNeighbor(state, focusedPaneId, direction) !== null
                 : false;
         };
-        const developerModeEnabled = () =>
-            developerCommandsEnabled &&
-            useSettingsStore.getState().developerModeEnabled &&
-            useSettingsStore.getState().developerTerminalEnabled;
         const activeTerminalTab = () => {
             const tab = selectFocusedEditorTab(useEditorStore.getState());
             return tab && isTerminalTab(tab) ? tab : null;
         };
         const canRestartActiveTerminal = () =>
-            developerModeEnabled() && activeTerminalTab() !== null;
+            developerCommandsEnabled && activeTerminalTab() !== null;
 
         // Navigation
         register({
@@ -684,7 +683,14 @@ function useRegisterCommands(
             category: newAgentShortcut.category,
             when: hasVault,
             execute: () => {
-                void createNewChatInWorkspace();
+                if (
+                    useChatStore.getState().getDefaultNewChatRuntimeId() ===
+                    CLAUDE_TERMINAL_RUNTIME_ID
+                ) {
+                    void openClaudeCodeTerminalWithContext();
+                } else {
+                    void createNewChatInWorkspace();
+                }
             },
         });
 
@@ -933,10 +939,10 @@ function useRegisterCommands(
         });
 
         register({
-            id: "developer:new-terminal-tab",
-            label: "New Terminal",
-            category: "Developer",
-            when: developerModeEnabled,
+            id: "workspace:new-terminal-tab",
+            label: newTerminalShortcut.label,
+            shortcut: formatShortcutAction(newTerminalShortcut.id, platform),
+            category: newTerminalShortcut.category,
             execute: () => {
                 useEditorStore.getState().openTerminal();
             },
@@ -1039,6 +1045,12 @@ function useGlobalShortcuts(openSettings: () => void) {
             if (matchesShortcutAction(e, "new_agent", platform)) {
                 e.preventDefault();
                 useCommandStore.getState().execute("ai:new-agent");
+                return;
+            }
+
+            if (matchesShortcutAction(e, "new_terminal", platform)) {
+                e.preventDefault();
+                useCommandStore.getState().execute("workspace:new-terminal-tab");
                 return;
             }
 
