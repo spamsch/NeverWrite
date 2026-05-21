@@ -915,6 +915,43 @@ describe("chatStore", () => {
         ).toBe(CLAUDE_TERMINAL_RUNTIME_ID);
     });
 
+    it("falls back when a persisted default runtime is no longer available", async () => {
+        localStorage.setItem(
+            AI_PREFS_KEY,
+            JSON.stringify({ defaultRuntimeId: "missing-runtime" }),
+        );
+
+        await useChatStore.getState().initialize();
+
+        const state = useChatStore.getState();
+        expect(state.selectedRuntimeId).toBe("codex-acp");
+        expect(state.getDefaultNewChatRuntimeId()).toBe("codex-acp");
+        expect(state.sessionsById["codex-session-1"]?.runtimeId).toBe(
+            "codex-acp",
+        );
+    });
+
+    it("falls back when a persisted Claude Code default is no longer ready", async () => {
+        localStorage.setItem(
+            AI_PREFS_KEY,
+            JSON.stringify({
+                defaultRuntimeId: CLAUDE_TERMINAL_RUNTIME_ID,
+            }),
+        );
+
+        await useChatStore.getState().initialize();
+
+        const state = useChatStore.getState();
+        expect(
+            state.setupStatusByRuntimeId[CLAUDE_TERMINAL_RUNTIME_ID],
+        ).toMatchObject({
+            authReady: false,
+            binaryReady: false,
+        });
+        expect(state.selectedRuntimeId).toBe("codex-acp");
+        expect(state.getDefaultNewChatRuntimeId()).toBe("codex-acp");
+    });
+
     it("selects the first configured runtime on fresh boot", async () => {
         const claudeRuntimePayload = {
             runtime: {

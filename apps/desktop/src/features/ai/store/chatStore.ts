@@ -5075,6 +5075,22 @@ function getImplicitDefaultAcpRuntimeId(
     );
 }
 
+function getSelectableDefaultRuntimeId(
+    runtimeId: string | null | undefined,
+    runtimes: AIRuntimeDescriptor[],
+    setupStatusByRuntimeId?: Record<string, AIRuntimeSetupStatus>,
+) {
+    if (!runtimeId) return null;
+    if (!runtimes.some((runtime) => runtime.runtime.id === runtimeId)) {
+        return null;
+    }
+
+    if (!setupStatusByRuntimeId) return runtimeId;
+    return isRuntimeSetupReady(setupStatusByRuntimeId[runtimeId])
+        ? runtimeId
+        : null;
+}
+
 function runtimeSupportsCapability(
     runtimes: AIRuntimeDescriptor[],
     runtimeId: string,
@@ -6424,8 +6440,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
         getDefaultNewChatRuntimeId: () => {
             const state = get();
             return (
-                state.selectedRuntimeId ??
-                loadAiPreferences().defaultRuntimeId ??
+                getSelectableDefaultRuntimeId(
+                    state.selectedRuntimeId,
+                    state.runtimes,
+                    state.setupStatusByRuntimeId,
+                ) ??
+                getSelectableDefaultRuntimeId(
+                    loadAiPreferences().defaultRuntimeId,
+                    state.runtimes,
+                    state.setupStatusByRuntimeId,
+                ) ??
                 getImplicitDefaultAcpRuntimeId(
                     state.runtimes,
                     state.setupStatusByRuntimeId,
@@ -6485,11 +6509,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     [CLAUDE_TERMINAL_RUNTIME_ID]:
                         buildClaudeTerminalSetupStatus(claudeFound),
                 };
-                // Persisted explicit selection wins. Otherwise stay on ACP
-                // runtimes; Claude Code remains available but is not promoted
-                // to the default just because the binary exists in PATH.
+                // Persisted explicit selection wins only while that runtime is
+                // still available and ready. Otherwise stay on ACP runtimes;
+                // Claude Code remains available but is not promoted to the
+                // default just because the binary exists in PATH.
                 const persistedRuntimeId =
-                    loadAiPreferences().defaultRuntimeId ?? null;
+                    getSelectableDefaultRuntimeId(
+                        loadAiPreferences().defaultRuntimeId,
+                        runtimes,
+                        setupStatusByRuntimeId,
+                    );
                 const defaultRuntimeId =
                     persistedRuntimeId ??
                     getImplicitDefaultAcpRuntimeId(
@@ -10282,7 +10311,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
             const runtimes = get().runtimes;
             const nextRuntimeId =
                 runtimeId ??
-                get().selectedRuntimeId ??
+                getSelectableDefaultRuntimeId(
+                    get().selectedRuntimeId,
+                    runtimes,
+                    get().setupStatusByRuntimeId,
+                ) ??
                 getDefaultRuntimeId(runtimes, get().setupStatusByRuntimeId);
             if (!nextRuntimeId) return null;
 
