@@ -149,6 +149,12 @@ import {
     subscribeSafeStorage,
 } from "../../../app/utils/safeStorage";
 import { logDebug, logError, logWarn } from "../../../app/utils/runtimeLog";
+import { CLAUDE_TERMINAL_RUNTIME_ID } from "../utils/runtimeMetadata";
+import {
+    CLAUDE_TERMINAL_DESCRIPTOR,
+    buildClaudeTerminalSetupStatus,
+} from "../utils/claudeTerminalRuntime";
+import { checkClaudeCodeInstalled } from "../../terminal/claudeCodeTerminal";
 
 const AI_PREFS_KEY = "neverwrite.ai.preferences";
 const AI_RUNTIME_CACHE_KEY = "neverwrite.ai.runtime-catalog";
@@ -197,6 +203,7 @@ interface AiPreferences {
     editDiffZoom?: number;
     historyRetentionDays?: number;
     screenshotRetentionSeconds?: number;
+    defaultRuntimeId?: string;
 }
 
 interface NormalizedAiPreferences {
@@ -1179,6 +1186,7 @@ interface ChatStore {
     ) => Promise<void>;
     syncAutoContextForVault: (vaultPath: string | null) => void;
     setSelectedRuntime: (runtimeId: string | null) => void;
+    getDefaultNewChatRuntimeId: () => string | null;
     refreshSetupStatus: (runtimeId?: string) => Promise<void>;
     saveSetup: (input: {
         runtimeId?: string;
@@ -1193,6 +1201,7 @@ interface ChatStore {
         gatewayBaseUrl?: string;
         gatewayHeaders: AISecretPatch;
         anthropicBaseUrl?: string;
+        anthropicBedrockBaseUrl?: string;
         anthropicCustomHeaders: AISecretPatch;
         anthropicAuthToken: AISecretPatch;
         anthropicApiKey?: AISecretPatch;
@@ -1211,6 +1220,7 @@ interface ChatStore {
         gatewayBaseUrl?: string;
         gatewayHeaders: AISecretPatch;
         anthropicBaseUrl?: string;
+        anthropicBedrockBaseUrl?: string;
         anthropicCustomHeaders: AISecretPatch;
         anthropicAuthToken: AISecretPatch;
         anthropicApiKey?: AISecretPatch;
@@ -4506,30 +4516,87 @@ function ensurePersistedTranscriptWindowAnchor(session: AIChatSession) {
     };
 }
 
+function resolveLoadedPersistedMessageStartForMetadata(
+    session: AIChatSession,
+    persistedMessageCount: number,
+) {
+    if (persistedMessageCount === 0) {
+        return 0;
+    }
+
+    const loadedStart = session.loadedPersistedMessageStart;
+    if (loadedStart == null) {
+        return null;
+    }
+    if (loadedStart < 0 || loadedStart > persistedMessageCount) {
+        return null;
+    }
+
+    // Persisted window markers are tied to the metadata count they were loaded
+    // against. If the count changed, reload the latest page and preserve only
+    // the live tail that sat after the old persisted window.
+    if ((session.persistedMessageCount ?? 0) !== persistedMessageCount) {
+        return null;
+    }
+
+    // Metadata can arrive after an earlier "empty history" pass. Keep the
+    // window marker only when the transcript still proves that window exists.
+    const loadedPersistedCount = persistedMessageCount - loadedStart;
+    return getSessionTranscriptLength(session) >= loadedPersistedCount
+        ? loadedStart
+        : null;
+}
+
 function applyPersistedHistoryMetadata(
     session: AIChatSession,
     history: PersistedSessionHistorySummary,
 ) {
     const persistedCatalog = getPersistedHistoryCatalogSnapshot(history);
+    const persistedMessageCount = getPersistedHistoryMessageCount(history);
+    const loadedPersistedMessageStart =
+        resolveLoadedPersistedMessageStartForMetadata(
+            session,
+            persistedMessageCount,
+        );
+    let nextSession = session;
+    if (
+        persistedMessageCount > 0 &&
+        session.loadedPersistedMessageStart != null &&
+        loadedPersistedMessageStart === null
+    ) {
+        // The persisted window marker no longer matches the refreshed history
+        // metadata. Drop the stale persisted window, but keep any live tail
+        // that was appended after it.
+        const previousPersistedWindowLength = Math.max(
+            0,
+            (session.persistedMessageCount ?? 0) -
+                session.loadedPersistedMessageStart,
+        );
+        const liveTail =
+            getSessionTranscriptMessages(session).slice(
+                previousPersistedWindowLength,
+            );
+        nextSession = replaceSessionTranscript(session, liveTail);
+    }
+
     if (hasRuntimeCatalog(persistedCatalog)) {
         saveRuntimeCatalogCache(session.runtimeId, persistedCatalog);
     }
 
     return hydrateSessionCatalogFromSnapshot(
         {
-            ...session,
+            ...nextSession,
             parentSessionId:
-                history.parent_session_id ?? session.parentSessionId ?? null,
+                history.parent_session_id ??
+                nextSession.parentSessionId ??
+                null,
             persistedCreatedAt: history.created_at,
             persistedUpdatedAt: history.updated_at,
             persistedTitle: history.title ?? null,
             customTitle: history.custom_title ?? null,
             persistedPreview: history.preview ?? null,
-            persistedMessageCount: getPersistedHistoryMessageCount(history),
-            loadedPersistedMessageStart:
-                getPersistedHistoryMessageCount(history) === 0
-                    ? 0
-                    : (session.loadedPersistedMessageStart ?? null),
+            persistedMessageCount,
+            loadedPersistedMessageStart,
         },
         persistedCatalog,
     );
@@ -4563,6 +4630,10 @@ function applyPersistedHistoryPage(
         preview: session.persistedPreview ?? undefined,
         messages: page.messages,
     });
+    const pageMessageIds = new Set(pageMessages.map((message) => message.id));
+    const liveTailNotInPage = liveTail.filter(
+        (message) => !pageMessageIds.has(message.id),
+    );
 
     const nextSession = {
         ...session,
@@ -4575,7 +4646,7 @@ function applyPersistedHistoryPage(
         nextSession,
         mode === "prepend"
             ? [...pageMessages, ...currentMessages]
-            : [...pageMessages, ...liveTail],
+            : [...pageMessages, ...liveTailNotInPage],
     );
 }
 
@@ -4973,6 +5044,10 @@ function isRuntimeSetupReady(setupStatus?: AIRuntimeSetupStatus | null) {
     return setupStatus?.authReady === true && !setupStatus.onboardingRequired;
 }
 
+function isClaudeTerminalRuntimeId(runtimeId?: string | null) {
+    return runtimeId === CLAUDE_TERMINAL_RUNTIME_ID;
+}
+
 function getDefaultRuntimeId(
     runtimes: AIRuntimeDescriptor[],
     setupStatusByRuntimeId?: Record<string, AIRuntimeSetupStatus>,
@@ -4986,6 +5061,34 @@ function getDefaultRuntimeId(
         : null;
 
     return readyRuntime?.runtime.id ?? runtimes[0]?.runtime.id ?? null;
+}
+
+function getImplicitDefaultAcpRuntimeId(
+    runtimes: AIRuntimeDescriptor[],
+    setupStatusByRuntimeId?: Record<string, AIRuntimeSetupStatus>,
+) {
+    return getDefaultRuntimeId(
+        runtimes.filter(
+            (runtime) => !isClaudeTerminalRuntimeId(runtime.runtime.id),
+        ),
+        setupStatusByRuntimeId,
+    );
+}
+
+function getSelectableDefaultRuntimeId(
+    runtimeId: string | null | undefined,
+    runtimes: AIRuntimeDescriptor[],
+    setupStatusByRuntimeId?: Record<string, AIRuntimeSetupStatus>,
+) {
+    if (!runtimeId) return null;
+    if (!runtimes.some((runtime) => runtime.runtime.id === runtimeId)) {
+        return null;
+    }
+
+    if (!setupStatusByRuntimeId) return runtimeId;
+    return isRuntimeSetupReady(setupStatusByRuntimeId[runtimeId])
+        ? runtimeId
+        : null;
 }
 
 function runtimeSupportsCapability(
@@ -5658,11 +5761,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     const shouldPrepend =
                         mode === "older" ||
                         (currentSession.messages.length > 0 &&
-                            (currentSession.loadedPersistedMessageStart ==
-                                null ||
-                                currentSession.loadedPersistedMessageStart >=
-                                    (currentSession.persistedMessageCount ??
-                                        0)));
+                            currentSession.loadedPersistedMessageStart != null &&
+                            currentSession.loadedPersistedMessageStart >=
+                                (currentSession.persistedMessageCount ?? 0));
 
                     return applyPersistedHistoryPage(
                         currentSession,
@@ -6333,6 +6434,27 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
         setSelectedRuntime: (runtimeId) => {
             set({ selectedRuntimeId: runtimeId });
+            saveAiPreferences({ defaultRuntimeId: runtimeId ?? undefined });
+        },
+
+        getDefaultNewChatRuntimeId: () => {
+            const state = get();
+            return (
+                getSelectableDefaultRuntimeId(
+                    state.selectedRuntimeId,
+                    state.runtimes,
+                    state.setupStatusByRuntimeId,
+                ) ??
+                getSelectableDefaultRuntimeId(
+                    loadAiPreferences().defaultRuntimeId,
+                    state.runtimes,
+                    state.setupStatusByRuntimeId,
+                ) ??
+                getImplicitDefaultAcpRuntimeId(
+                    state.runtimes,
+                    state.setupStatusByRuntimeId,
+                )
+            );
         },
 
         initialize: async (options) => {
@@ -6346,17 +6468,17 @@ export const useChatStore = create<ChatStore>((set, get) => {
             set({ isInitializing: true });
 
             try {
-                const runtimes = hydrateRuntimesFromCache(
+                const backendRuntimes = hydrateRuntimesFromCache(
                     await aiListRuntimes(),
                 );
-                const runtimeIds = runtimes.map(
+                const runtimeIds = backendRuntimes.map(
                     (descriptor) => descriptor.runtime.id,
                 );
                 const setupResults = await Promise.allSettled(
                     runtimeIds.map((runtimeId) => aiGetSetupStatus(runtimeId)),
                 );
                 const runtimeConnectionByRuntimeId = buildRuntimeConnectionMap(
-                    runtimes,
+                    backendRuntimes,
                     get().runtimeConnectionByRuntimeId,
                 );
                 const setupStatuses: AIRuntimeSetupStatus[] = [];
@@ -6377,11 +6499,32 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         ),
                     };
                 });
-                const setupStatusByRuntimeId =
-                    buildSetupStatusMap(setupStatuses);
+                const claudeFound = await checkClaudeCodeInstalled();
+                const runtimes = [
+                    ...backendRuntimes,
+                    CLAUDE_TERMINAL_DESCRIPTOR,
+                ];
+                const setupStatusByRuntimeId = {
+                    ...buildSetupStatusMap(setupStatuses),
+                    [CLAUDE_TERMINAL_RUNTIME_ID]:
+                        buildClaudeTerminalSetupStatus(claudeFound),
+                };
+                // Persisted explicit selection wins only while that runtime is
+                // still available and ready. Otherwise stay on ACP runtimes;
+                // Claude Code remains available but is not promoted to the
+                // default just because the binary exists in PATH.
+                const persistedRuntimeId =
+                    getSelectableDefaultRuntimeId(
+                        loadAiPreferences().defaultRuntimeId,
+                        runtimes,
+                        setupStatusByRuntimeId,
+                    );
                 const defaultRuntimeId =
-                    get().selectedRuntimeId ??
-                    getDefaultRuntimeId(runtimes, setupStatusByRuntimeId);
+                    persistedRuntimeId ??
+                    getImplicitDefaultAcpRuntimeId(
+                        runtimes,
+                        setupStatusByRuntimeId,
+                    );
 
                 set({
                     runtimes,
@@ -6430,6 +6573,19 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
                 if (sessions.length || histories.length) {
                     set((state) => {
+                        const existingSessionByHistoryId = new Map(
+                            Object.values(state.sessionsById).flatMap(
+                                (session) =>
+                                    session.historySessionId
+                                        ? [
+                                              [
+                                                  session.historySessionId,
+                                                  session,
+                                              ] as const,
+                                          ]
+                                        : [],
+                            ),
+                        );
                         const nextSessionsById = sessions.reduce<
                             Record<string, AIChatSession>
                         >((accumulator, session) => {
@@ -6438,7 +6594,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
                                 vaultPath,
                             );
                             const existing =
-                                state.sessionsById[scopedSession.sessionId];
+                                state.sessionsById[scopedSession.sessionId] ??
+                                existingSessionByHistoryId.get(
+                                    scopedSession.historySessionId,
+                                );
                             let merged = mergeSession(existing, scopedSession);
                             const persisted = persistedBySessionId.get(
                                 merged.historySessionId,
@@ -6489,7 +6648,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
                                 vaultPath,
                             );
                             if (!restored) continue;
-                            nextSessionsById[restored.sessionId] = restored;
+                            const existing =
+                                state.sessionsById[restored.sessionId] ??
+                                existingSessionByHistoryId.get(
+                                    restored.historySessionId,
+                                );
+                            nextSessionsById[restored.sessionId] =
+                                mergeSession(existing, restored);
                         }
 
                         const nextSessionOrder =
@@ -6605,8 +6770,17 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }
 
             const sessionIdsNeedingCatalog = new Set<string>();
+            const restoredSessionIds: string[] = [];
+            const restoredSessionIdSet = new Set<string>();
             const vaultPath = useVaultStore.getState().vaultPath;
             const resolvedSessionIdByTabId = new Map<string, string>();
+            const rememberRestoredSessionId = (sessionId: string) => {
+                if (restoredSessionIdSet.has(sessionId)) {
+                    return;
+                }
+                restoredSessionIdSet.add(sessionId);
+                restoredSessionIds.push(sessionId);
+            };
 
             set((state) => {
                 const nextSessionsById = { ...state.sessionsById };
@@ -6639,6 +6813,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     if (!currentSession) {
                         continue;
                     }
+                    rememberRestoredSessionId(resolvedSessionId);
 
                     let nextSession = currentSession;
                     if (
@@ -6702,37 +6877,52 @@ export const useChatStore = create<ChatStore>((set, get) => {
                   null)
                 : null;
             if (!activeSessionId) {
+                for (const sessionId of restoredSessionIds) {
+                    await get().ensureSessionTranscriptLoaded(
+                        sessionId,
+                        "latest",
+                    );
+                }
                 return;
             }
 
             let activeSession: AIChatSession | null =
                 get().sessionsById[activeSessionId] ?? null;
-            if (!activeSession) {
-                return;
+            if (activeSession) {
+                if (
+                    !isLiveRuntimeSession(activeSession) &&
+                    !activeSession.isResumingSession
+                ) {
+                    const resumedSessionId =
+                        await get().resumeSession(activeSessionId);
+                    activeSession =
+                        (resumedSessionId
+                            ? get().sessionsById[resumedSessionId]
+                            : null) ?? null;
+                }
+
+                if (activeSession) {
+                    await ensureSessionAgentCatalogLoaded(
+                        activeSession.sessionId,
+                    );
+                    if (isLiveRuntimeSession(activeSession)) {
+                        await get().ensureSessionTranscriptLoaded(
+                            activeSession.sessionId,
+                            "latest",
+                        );
+                    }
+                }
             }
 
-            if (
-                !isLiveRuntimeSession(activeSession) &&
-                !activeSession.isResumingSession
-            ) {
-                const resumedSessionId =
-                    await get().resumeSession(activeSessionId);
-                activeSession =
-                    (resumedSessionId
-                        ? get().sessionsById[resumedSessionId]
-                        : null) ?? null;
-            }
-
-            if (!activeSession) {
-                return;
-            }
-
-            await ensureSessionAgentCatalogLoaded(activeSession.sessionId);
-            if (isLiveRuntimeSession(activeSession)) {
-                await get().ensureSessionTranscriptLoaded(
-                    activeSession.sessionId,
-                    "latest",
-                );
+            for (const sessionId of restoredSessionIds) {
+                if (sessionId === activeSessionId) {
+                    continue;
+                }
+                const session = get().sessionsById[sessionId];
+                if (!session || session.isResumingSession) {
+                    continue;
+                }
+                await get().ensureSessionTranscriptLoaded(sessionId, "latest");
             }
         },
 
@@ -6860,6 +7050,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     input.gatewayBaseUrl ||
                     secretPatchChanged(input.gatewayHeaders) ||
                     input.anthropicBaseUrl ||
+                    input.anthropicBedrockBaseUrl ||
                     secretPatchChanged(input.anthropicCustomHeaders) ||
                     secretPatchChanged(input.anthropicAuthToken) ||
                     secretPatchChanged(
@@ -6879,6 +7070,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         gatewayBaseUrl: input.gatewayBaseUrl,
                         gatewayHeaders: input.gatewayHeaders,
                         anthropicBaseUrl: input.anthropicBaseUrl,
+                        anthropicBedrockBaseUrl: input.anthropicBedrockBaseUrl,
                         anthropicCustomHeaders: input.anthropicCustomHeaders,
                         anthropicAuthToken: input.anthropicAuthToken,
                         anthropicApiKey: input.anthropicApiKey,
@@ -10119,7 +10311,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
             const runtimes = get().runtimes;
             const nextRuntimeId =
                 runtimeId ??
-                get().selectedRuntimeId ??
+                getSelectableDefaultRuntimeId(
+                    get().selectedRuntimeId,
+                    runtimes,
+                    get().setupStatusByRuntimeId,
+                ) ??
                 getDefaultRuntimeId(runtimes, get().setupStatusByRuntimeId);
             if (!nextRuntimeId) return null;
 
