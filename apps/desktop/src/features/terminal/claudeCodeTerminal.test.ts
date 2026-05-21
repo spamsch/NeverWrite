@@ -172,6 +172,11 @@ describe("openClaudeCodeTerminalWithContext", () => {
                     filePath: "/vault root/assets/chart (v1).png",
                     mimeType: "image/png",
                 },
+                {
+                    fileName: 'he said "yes".md',
+                    filePath: '/vault root/assets/he said "yes".md',
+                    mimeType: "text/markdown",
+                },
             ],
             folder: {
                 name: "Draft Folder",
@@ -193,7 +198,11 @@ describe("openClaudeCodeTerminalWithContext", () => {
         expect(getWrittenInputs()).toEqual([
             "cd '/vault root/Draft Folder'\n",
             "claude\n",
-            '@"Project Notes/One note.md" @"assets/chart (v1).png"',
+            [
+                '@"Project Notes/One note.md"',
+                '@"assets/chart (v1).png"',
+                '@"assets/he said \\"yes\\".md"',
+            ].join(" "),
         ]);
     });
 

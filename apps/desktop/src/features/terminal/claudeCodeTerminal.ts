@@ -88,7 +88,7 @@ function getNextClaudeCodeTerminalTitle(): string {
 // that contains characters outside the safe unquoted set so the mention parser
 // doesn't split on spaces, parens, brackets, etc.
 function quoteForMention(path: string): string {
-    return /^[A-Za-z0-9_./-]+$/.test(path) ? path : `"${path}"`;
+    return /^[A-Za-z0-9_./-]+$/.test(path) ? path : JSON.stringify(path);
 }
 
 // Strip the vault root prefix so @mentions are vault-relative rather than
