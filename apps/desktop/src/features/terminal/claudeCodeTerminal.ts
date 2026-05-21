@@ -34,6 +34,24 @@ const TERMINAL_READY_TIMEOUT_MS = 10_000;
 // A proper fix would watch rawOutput for a stable ready marker, but that depends
 // on Claude Code's output format staying stable across versions.
 const CLAUDE_TUI_SETTLE_MS = 3_500;
+const CLAUDE_CODE_TERMINAL_TITLE = "Claude Code";
+const CLAUDE_CODE_TERMINAL_TITLE_PATTERN = /^Claude Code(?: (\d+))?$/;
+
+function getNextClaudeCodeTerminalTitle(): string {
+    const maxExistingIndex = selectEditorWorkspaceTabs(
+        useEditorStore.getState(),
+    ).reduce((maxIndex, tab) => {
+        if (!isTerminalTab(tab)) return maxIndex;
+
+        const match = tab.title.trim().match(CLAUDE_CODE_TERMINAL_TITLE_PATTERN);
+        if (!match) return maxIndex;
+
+        const index = match[1] ? Number(match[1]) : 1;
+        return Number.isFinite(index) ? Math.max(maxIndex, index) : maxIndex;
+    }, 0);
+
+    return `${CLAUDE_CODE_TERMINAL_TITLE} ${maxExistingIndex + 1}`;
+}
 
 // Quote a path for a Claude Code @mention. Use double quotes around any path
 // that contains characters outside the safe unquoted set so the mention parser
@@ -127,7 +145,11 @@ export async function openClaudeCodeTerminalWithContext(
     const vaultPath = useVaultStore.getState().vaultPath;
     const tabId = useEditorStore
         .getState()
-        .openTerminal({ cwd: vaultPath ?? undefined, paneId });
+        .openTerminal({
+            cwd: vaultPath ?? undefined,
+            paneId,
+            title: getNextClaudeCodeTerminalTitle(),
+        });
     if (!tabId) return;
 
     const tab = selectEditorWorkspaceTabs(useEditorStore.getState()).find(

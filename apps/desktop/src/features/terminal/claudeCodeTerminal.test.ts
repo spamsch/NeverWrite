@@ -39,8 +39,10 @@ function makeRunningSnapshot(
 
 async function attachOpenedTerminalRuntime() {
     await Promise.resolve();
-    const tab = selectEditorWorkspaceTabs(useEditorStore.getState()).find(
-        (candidate): candidate is TerminalTab => isTerminalTab(candidate),
+    const editorState = useEditorStore.getState();
+    const tab = selectEditorWorkspaceTabs(editorState).find(
+        (candidate): candidate is TerminalTab =>
+            isTerminalTab(candidate) && candidate.id === editorState.activeTabId,
     );
     expect(tab).toBeDefined();
     useTerminalRuntimeStore.setState({
@@ -117,6 +119,7 @@ describe("openClaudeCodeTerminalWithContext", () => {
             useEditorStore.getState(),
         ).find(isTerminalTab);
         expect(terminalTab).toMatchObject({
+            title: "Claude Code 1",
             cwd: "/vault root",
         });
         expect(getWrittenInputs()).toEqual([
@@ -166,6 +169,50 @@ describe("openClaudeCodeTerminalWithContext", () => {
             "cd '/vault root/Draft Folder'\n",
             "claude\n",
             '@"Project Notes/One note.md" @"assets/chart (v1).png"',
+        ]);
+    });
+
+    it("numbers Claude Code terminals independently from regular terminals", async () => {
+        useEditorStore.getState().hydrateWorkspace(
+            [
+                {
+                    id: "primary",
+                    tabs: [
+                        {
+                            id: "terminal-tab-1",
+                            kind: "terminal",
+                            terminalId: "terminal-1",
+                            title: "Terminal 1",
+                            cwd: "/vault root",
+                        },
+                        {
+                            id: "claude-code-tab-1",
+                            kind: "terminal",
+                            terminalId: "claude-code-1",
+                            title: "Claude Code 1",
+                            cwd: "/vault root",
+                        },
+                    ],
+                    activeTabId: "claude-code-tab-1",
+                },
+            ],
+            "primary",
+        );
+
+        const opening = openClaudeCodeTerminalWithContext();
+        await attachOpenedTerminalRuntime();
+        await opening;
+
+        const terminalTitles = selectEditorWorkspaceTabs(
+            useEditorStore.getState(),
+        )
+            .filter(isTerminalTab)
+            .map((tab) => tab.title);
+
+        expect(terminalTitles).toEqual([
+            "Terminal 1",
+            "Claude Code 1",
+            "Claude Code 2",
         ]);
     });
 });
