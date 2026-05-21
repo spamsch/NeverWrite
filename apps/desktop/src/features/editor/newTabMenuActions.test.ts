@@ -84,9 +84,16 @@ describe("newTabMenuActions", () => {
         expect(
             chatPaneMovementMock.createNewChatInWorkspace,
         ).not.toHaveBeenCalled();
+        expect(useChatStore.getState().selectedRuntimeId).toBe(
+            CLAUDE_TERMINAL_RUNTIME_ID,
+        );
     });
 
     it("keeps ACP agent entries on the normal chat creation path", async () => {
+        useChatStore.setState({
+            selectedRuntimeId: CLAUDE_TERMINAL_RUNTIME_ID,
+        });
+
         getNewAgentChild("Codex").action?.();
 
         await waitFor(() => {
@@ -97,5 +104,6 @@ describe("newTabMenuActions", () => {
         expect(
             claudeCodeTerminalMock.openClaudeCodeTerminalWithContext,
         ).not.toHaveBeenCalled();
+        expect(useChatStore.getState().selectedRuntimeId).toBe("codex-acp");
     });
 });

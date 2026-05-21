@@ -479,7 +479,7 @@ describe("createNewChatInWorkspace", () => {
         expect(selectEditorWorkspaceTabs(useEditorStore.getState())).toEqual([]);
     });
 
-    it("does not create an ACP chat when Claude Code terminal is the explicit default runtime", async () => {
+    it("uses the selected native runtime over a stale Claude Code terminal preference", async () => {
         localStorage.setItem(
             AI_PREFS_KEY,
             JSON.stringify({ defaultRuntimeId: CLAUDE_TERMINAL_RUNTIME_ID }),
@@ -501,11 +501,12 @@ describe("createNewChatInWorkspace", () => {
         const upsertSession = vi.spyOn(useChatStore.getState(), "upsertSession");
         const openChat = vi.spyOn(useEditorStore.getState(), "openChat");
 
-        await expect(createNewChatInWorkspace()).resolves.toBeNull();
+        const sessionId = await createNewChatInWorkspace();
 
-        expect(newSession).not.toHaveBeenCalled();
-        expect(upsertSession).not.toHaveBeenCalled();
-        expect(openChat).not.toHaveBeenCalled();
+        expect(sessionId).toMatch(/^pending:/);
+        expect(newSession).toHaveBeenCalledWith("codex-acp", sessionId);
+        expect(upsertSession).toHaveBeenCalled();
+        expect(openChat).toHaveBeenCalled();
     });
 
     it("does not create a pending chat when Claude Code terminal is the only ready runtime", async () => {

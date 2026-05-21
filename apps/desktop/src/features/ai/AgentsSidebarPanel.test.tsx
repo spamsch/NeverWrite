@@ -12,6 +12,7 @@ import {
     AGENT_SIDEBAR_DRAG_EVENT,
     type AgentSidebarDragDetail,
 } from "./agentSidebarDragEvents";
+import { CLAUDE_TERMINAL_RUNTIME_ID } from "./utils/runtimeMetadata";
 
 const chatPaneMovementMock = vi.hoisted(() => ({
     createNewChatInWorkspace: vi.fn(),
@@ -193,6 +194,9 @@ describe("AgentsSidebarPanel", () => {
         expect(
             chatPaneMovementMock.createNewChatInWorkspace,
         ).not.toHaveBeenCalled();
+        expect(useChatStore.getState().selectedRuntimeId).toBe(
+            CLAUDE_TERMINAL_RUNTIME_ID,
+        );
     });
 
     it("keeps open working agents in the order they became busy", async () => {

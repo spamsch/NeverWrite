@@ -496,6 +496,7 @@ export function AgentsSidebarPanel() {
         return sortedRuntimes.map((runtime) => ({
             label: getRuntimeMenuLabel(runtime.runtime.name),
             action: () => {
+                useChatStore.getState().setSelectedRuntime(runtime.runtime.id);
                 if (runtime.runtime.id === CLAUDE_TERMINAL_RUNTIME_ID) {
                     void openClaudeCodeTerminalWithContext();
                     return;

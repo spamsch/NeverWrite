@@ -6422,14 +6422,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
         },
 
         getDefaultNewChatRuntimeId: () => {
-            // Reads the user's persisted explicit choice first. Claude Code is
-            // a terminal pseudo-runtime, so detection alone must not promote it
-            // over ACP runtimes for new chats.
-            const explicit = loadAiPreferences().defaultRuntimeId ?? null;
-            if (explicit !== null) return explicit;
             const state = get();
             return (
                 state.selectedRuntimeId ??
+                loadAiPreferences().defaultRuntimeId ??
                 getImplicitDefaultAcpRuntimeId(
                     state.runtimes,
                     state.setupStatusByRuntimeId,
