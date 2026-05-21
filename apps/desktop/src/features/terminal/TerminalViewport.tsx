@@ -326,7 +326,7 @@ export function TerminalViewport({
                 },
             );
 
-            textarea = terminal.textarea;
+            textarea = terminal.textarea ?? null;
             handleFocus = () => {
                 shouldRestoreFocusRef.current = true;
                 setFocused(true);

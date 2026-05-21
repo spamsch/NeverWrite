@@ -18,8 +18,12 @@ const chatPaneMovementMock = vi.hoisted(() => ({
     openChatHistoryInWorkspace: vi.fn(),
     openChatSessionInWorkspace: vi.fn(),
 }));
+const claudeCodeTerminalMock = vi.hoisted(() => ({
+    openClaudeCodeTerminalWithContext: vi.fn(async () => undefined),
+}));
 
 vi.mock("./chatPaneMovement", () => chatPaneMovementMock);
+vi.mock("../terminal/claudeCodeTerminal", () => claudeCodeTerminalMock);
 
 function createSession(
     sessionId: string,
@@ -143,6 +147,52 @@ describe("AgentsSidebarPanel", () => {
         expect(
             screen.queryByRole("button", { name: "Add providers" }),
         ).toBeNull();
+    });
+
+    it("opens Claude Code from the plus menu as a terminal runtime", async () => {
+        useChatStore.setState({
+            runtimes: [
+                {
+                    runtime: {
+                        id: "codex-acp",
+                        name: "Codex ACP",
+                        description: "",
+                        capabilities: [],
+                    },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+                {
+                    runtime: {
+                        id: "claude-code-terminal",
+                        name: "Claude Code",
+                        description: "",
+                        capabilities: [],
+                    },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            selectedRuntimeId: "codex-acp",
+        });
+
+        renderComponent(<AgentsSidebarPanel />);
+
+        fireEvent.click(screen.getByRole("button", { name: "New chat" }));
+        fireEvent.click(
+            await screen.findByRole("button", { name: "Claude Code" }),
+        );
+
+        await waitFor(() => {
+            expect(
+                claudeCodeTerminalMock.openClaudeCodeTerminalWithContext,
+            ).toHaveBeenCalledTimes(1);
+        });
+        expect(
+            chatPaneMovementMock.createNewChatInWorkspace,
+        ).not.toHaveBeenCalled();
     });
 
     it("keeps open working agents in the order they became busy", async () => {

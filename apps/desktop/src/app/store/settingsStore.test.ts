@@ -29,6 +29,17 @@ describe("settingsStore developer mode", () => {
     it("defaults developerModeEnabled to false", () => {
         expect(useSettingsStore.getState().developerModeEnabled).toBe(false);
         expect(useSettingsStore.getState().developerTerminalEnabled).toBe(true);
+        expect(useSettingsStore.getState().terminalFontFamily).toBe("");
+        expect(useSettingsStore.getState().terminalFontSize).toBe(13);
+        expect(useSettingsStore.getState().claudeCodeOptimized).toBe(false);
+        expect(useSettingsStore.getState().claudeCodeSkipPermissions).toBe(
+            false,
+        );
+        expect(useSettingsStore.getState().claudeCodeModel).toBe("");
+        expect(useSettingsStore.getState().claudeCodeContinueSession).toBe(
+            false,
+        );
+        expect(useSettingsStore.getState().claudeCodeMaxTurns).toBe(0);
         expect(useSettingsStore.getState().inlineReviewEnabled).toBe(true);
         expect(useSettingsStore.getState().pdfFilter).toBe("none");
         expect(useSettingsStore.getState().editorSpellcheck).toBe(false);
@@ -75,6 +86,61 @@ describe("settingsStore developer mode", () => {
                 editorAutosaveDelayMs: 750,
             },
         });
+    });
+
+    it("persists terminal settings per vault", () => {
+        useVaultStore.setState({ vaultPath: "/vaults/terminal" });
+
+        useSettingsStore
+            .getState()
+            .setSetting("terminalFontFamily", "FiraCode Nerd Font");
+        useSettingsStore.getState().setSetting("terminalFontSize", 16);
+        useSettingsStore.getState().setSetting("claudeCodeOptimized", true);
+        useSettingsStore
+            .getState()
+            .setSetting("claudeCodeSkipPermissions", true);
+        useSettingsStore
+            .getState()
+            .setSetting("claudeCodeModel", "claude-sonnet-4-6");
+        useSettingsStore
+            .getState()
+            .setSetting("claudeCodeContinueSession", true);
+        useSettingsStore.getState().setSetting("claudeCodeMaxTurns", 12);
+
+        expect(
+            JSON.parse(
+                localStorage.getItem("neverwrite:settings:/vaults/terminal") ??
+                    "",
+            ),
+        ).toMatchObject({
+            state: {
+                terminalFontFamily: "FiraCode Nerd Font",
+                terminalFontSize: 16,
+                claudeCodeOptimized: true,
+                claudeCodeSkipPermissions: true,
+                claudeCodeModel: "claude-sonnet-4-6",
+                claudeCodeContinueSession: true,
+                claudeCodeMaxTurns: 12,
+            },
+        });
+    });
+
+    it("normalizes persisted terminal numeric settings", () => {
+        localStorage.setItem(
+            "neverwrite:settings",
+            JSON.stringify({
+                state: {
+                    terminalFontSize: 99,
+                    claudeCodeMaxTurns: -3,
+                },
+            }),
+        );
+
+        disposeSettingsStoreRuntime();
+        initializeSettingsStore();
+
+        expect(useSettingsStore.getState().terminalFontSize).toBe(24);
+        expect(useSettingsStore.getState().claudeCodeMaxTurns).toBe(0);
     });
 
     it("persists custom spellcheck language tags as plain strings", () => {
