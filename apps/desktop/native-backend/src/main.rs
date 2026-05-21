@@ -1463,8 +1463,8 @@ impl NativeBackend {
 
     fn copy_external_file_to_vault(&mut self, args: Value) -> Result<Value, String> {
         let source_path = required_string(&args, &["sourcePath", "source_path"])?;
-        let target_folder = optional_string(&args, &["targetFolder", "target_folder"])
-            .unwrap_or_default();
+        let target_folder =
+            optional_string(&args, &["targetFolder", "target_folder"]).unwrap_or_default();
         let (vault_path, state) = self.state_mut(&args)?;
 
         let source = std::path::PathBuf::from(&source_path);
@@ -1497,21 +1497,37 @@ impl NativeBackend {
             file_name: entry.file_name.clone(),
             mime_type: entry.mime_type.clone(),
         };
-        let revision =
-            advance_revision(&mut state.file_revisions, &entry.relative_path, None).max(1);
         Self::refresh_vault_state(state)?;
-        let change = build_vault_note_change(
-            &vault_path,
-            "upsert",
-            None,
-            None,
-            Some(entry),
-            Some(detail.relative_path.clone()),
-            None,
-            revision,
-            None,
-            state.graph_revision.max(1),
-        );
+        let change = if entry.kind == "note" {
+            let note = state
+                .vault
+                .read_note_from_path(&target)
+                .map_err(|error| error.to_string())?;
+            let revision = advance_revision(&mut state.note_revisions, &note.id.0, None).max(1);
+            note_change_from_document(
+                &vault_path,
+                &note,
+                detail.relative_path.clone(),
+                None,
+                revision,
+                state.graph_revision.max(1),
+            )
+        } else {
+            let revision =
+                advance_revision(&mut state.file_revisions, &entry.relative_path, None).max(1);
+            build_vault_note_change(
+                &vault_path,
+                "upsert",
+                None,
+                None,
+                Some(entry),
+                Some(detail.relative_path.clone()),
+                None,
+                revision,
+                None,
+                state.graph_revision.max(1),
+            )
+        };
         self.emit_vault_change(change);
         Ok(json!(detail))
     }
@@ -3364,6 +3380,64 @@ mod tests {
             detail.get("content").and_then(Value::as_str),
             Some("export const value = 1;\n")
         );
+    }
+
+    #[test]
+    fn external_markdown_copy_emits_note_change() {
+        let (event_tx, event_rx) = mpsc::channel::<RpcOutput>();
+        let backend = Arc::new(Mutex::new(NativeBackend::new(event_tx)));
+        let vault_dir = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("Imported.md");
+        fs::write(&source_path, "# Imported\n\n[[Existing]] #tag-one\n").unwrap();
+
+        let vault_path = vault_dir.path().to_string_lossy().to_string();
+        invoke(&backend, "start_open_vault", json!({ "path": vault_path })).unwrap();
+
+        let detail = invoke(
+            &backend,
+            "copy_external_file_to_vault",
+            json!({
+                "vaultPath": vault_path,
+                "sourcePath": source_path.to_string_lossy().to_string(),
+                "targetFolder": "Inbox",
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            detail.get("relative_path").and_then(Value::as_str),
+            Some("Inbox/Imported.md")
+        );
+
+        let change = recv_vault_change(&event_rx);
+        assert_eq!(change.get("kind").and_then(Value::as_str), Some("upsert"));
+        assert_eq!(
+            change.get("note_id").and_then(Value::as_str),
+            Some("Inbox/Imported")
+        );
+        assert_eq!(
+            change.get("relative_path").and_then(Value::as_str),
+            Some("Inbox/Imported.md")
+        );
+        assert_eq!(change.get("entry"), Some(&Value::Null));
+        assert_eq!(
+            change
+                .get("note")
+                .and_then(|note| note.get("id"))
+                .and_then(Value::as_str),
+            Some("Inbox/Imported")
+        );
+        assert_eq!(
+            change.get("content_hash").and_then(Value::as_str),
+            Some(content_hash_bytes(b"# Imported\n\n[[Existing]] #tag-one\n").as_str())
+        );
+
+        let notes = invoke(&backend, "list_notes", json!({ "vaultPath": vault_path })).unwrap();
+        assert!(notes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.get("id").and_then(Value::as_str) == Some("Inbox/Imported")));
     }
 
     #[test]
