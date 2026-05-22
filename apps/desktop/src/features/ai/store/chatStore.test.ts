@@ -6251,6 +6251,181 @@ describe("chatStore", () => {
         ]);
     });
 
+    it("stores chat tool fragment hunks with file-relative line numbers", async () => {
+        const oldLines = Array.from(
+            { length: 1180 },
+            (_, index) => `line ${index + 1}`,
+        );
+        oldLines[1] = "old target";
+        oldLines[1175] = "unique context before target";
+        oldLines[1176] = "old target";
+        oldLines[1177] = "unique context after target";
+        const oldText = oldLines.join("\n");
+        const newLines = [...oldLines];
+        newLines[1176] = "new target";
+        const newText = newLines.join("\n");
+
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+        useEditorStore.setState({
+            tabs: [
+                {
+                    id: "tab-1",
+                    kind: "file",
+                    relativePath: "posts/article.md",
+                    path: "/vault/posts/article.md",
+                    title: "article.md",
+                    content: oldText,
+                    mimeType: "text/markdown",
+                    viewer: "text",
+                    history: [],
+                    historyIndex: 0,
+                },
+            ],
+            activeTabId: "tab-1",
+            activationHistory: ["tab-1"],
+            tabNavigationHistory: ["tab-1"],
+            tabNavigationIndex: 0,
+        });
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+
+        useChatStore.getState().applyToolActivity({
+            session_id: activeSessionId,
+            tool_call_id: "tool-fragment-hunk-lines",
+            title: "Edit article.md",
+            kind: "edit",
+            status: "completed",
+            target: "/vault/posts/article.md",
+            diffs: [
+                {
+                    path: "/vault/posts/article.md",
+                    kind: "update",
+                    old_text:
+                        "unique context before target\nold target\nunique context after target",
+                    new_text:
+                        "unique context before target\nnew target\nunique context after target",
+                    reversible: true,
+                    hunks: [
+                        {
+                            old_start: 2,
+                            old_count: 1,
+                            new_start: 2,
+                            new_count: 1,
+                            lines: [
+                                { type: "remove", text: "old target" },
+                                { type: "add", text: "new target" },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        });
+
+        const message =
+            useChatStore.getState().sessionsById[activeSessionId]!
+                .messages.find(
+                    (item) => item.id === "tool:tool-fragment-hunk-lines",
+                );
+        const diff = message?.diffs?.[0];
+
+        expect(diff).toMatchObject({
+            old_text: oldText,
+            new_text: newText,
+        });
+        expect(diff?.hunks?.[0]).toMatchObject({
+            old_start: 1177,
+            new_start: 1177,
+        });
+        expect(getVisibleBuffer(activeSessionId)).toMatchObject([
+            {
+                diffBase: oldText,
+                currentText: newText,
+            },
+        ]);
+    });
+
+    it("derives chat tool hunks for normalized large fragment diffs", async () => {
+        const oldLines = Array.from(
+            { length: 1200 },
+            (_, index) => `line ${index + 1}`,
+        );
+        oldLines[1094] = "paragraph to remove";
+        const oldText = oldLines.join("\n");
+        const newLines = oldLines.filter((_, index) => index !== 1094);
+        const newText = newLines.join("\n");
+
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+        useEditorStore.setState({
+            tabs: [
+                {
+                    id: "tab-1",
+                    kind: "file",
+                    relativePath: "posts/article.md",
+                    path: "/vault/posts/article.md",
+                    title: "article.md",
+                    content: oldText,
+                    mimeType: "text/markdown",
+                    viewer: "text",
+                    history: [],
+                    historyIndex: 0,
+                },
+            ],
+            activeTabId: "tab-1",
+            activationHistory: ["tab-1"],
+            tabNavigationHistory: ["tab-1"],
+            tabNavigationIndex: 0,
+        });
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+
+        useChatStore.getState().applyToolActivity({
+            session_id: activeSessionId,
+            tool_call_id: "tool-fragment-derived-hunk",
+            title: "Edit article.md",
+            kind: "edit",
+            status: "completed",
+            target: "/vault/posts/article.md",
+            diffs: [
+                {
+                    path: "/vault/posts/article.md",
+                    kind: "update",
+                    old_text: "paragraph to remove\n",
+                    new_text: "",
+                    reversible: true,
+                },
+            ],
+        });
+
+        const message =
+            useChatStore.getState().sessionsById[activeSessionId]!
+                .messages.find(
+                    (item) => item.id === "tool:tool-fragment-derived-hunk",
+                );
+        const diff = message?.diffs?.[0];
+
+        expect(diff).toMatchObject({
+            old_text: oldText,
+            new_text: newText,
+        });
+        expect(diff?.hunks).toEqual([
+            {
+                old_start: 1095,
+                old_count: 1,
+                new_start: 1095,
+                new_count: 0,
+                lines: [{ type: "remove", text: "paragraph to remove" }],
+            },
+        ]);
+    });
+
     it("treats fragmentary delete diffs as inline updates when the file still has content", async () => {
         useVaultStore.setState({
             vaultPath: "/vault",
@@ -6950,6 +7125,15 @@ describe("chatStore", () => {
                 },
             ],
         });
+        const firstMessageBeforeCycleB =
+            useChatStore.getState().sessionsById[activeSessionId]!.messages.find(
+                (message) => message.id === "tool:tool-cycle-a",
+            );
+        expect(firstMessageBeforeCycleB?.reviewDiffs?.[0]).toMatchObject({
+            path: "/notes/file.md",
+            old_text: "original",
+            new_text: "first edit",
+        });
 
         // Start cycle B
         useChatStore.getState().setComposerParts(createTextParts("Next turn"));
@@ -6982,6 +7166,126 @@ describe("chatStore", () => {
                 currentText: "second edit",
             },
         ]);
+        const firstMessageAfterCycleB =
+            useChatStore.getState().sessionsById[activeSessionId]!.messages.find(
+                (message) => message.id === "tool:tool-cycle-a",
+            );
+        expect(firstMessageAfterCycleB?.reviewDiffs?.[0]).toMatchObject({
+            path: "/notes/file.md",
+            old_text: "original",
+            new_text: "first edit",
+        });
+        const secondMessage =
+            useChatStore.getState().sessionsById[activeSessionId]!.messages.find(
+                (message) => message.id === "tool:tool-cycle-b",
+            );
+        expect(secondMessage?.reviewDiffs?.[0]).toMatchObject({
+            path: "/notes/file.md",
+            old_text: "first edit",
+            new_text: "second edit",
+        });
+    });
+
+    it("freezes non-trackable tool diff cards before later tracked edits touch the same file", async () => {
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+
+        useChatStore.getState().applyToolActivity({
+            session_id: activeSessionId,
+            tool_call_id: "tool-untracked-preview",
+            title: "Edit file",
+            kind: "edit",
+            status: "completed",
+            diffs: [
+                {
+                    path: "/notes/file.md",
+                    kind: "update",
+                    old_text: "opaque old",
+                    new_text: "opaque preview",
+                    reversible: false,
+                },
+            ],
+        });
+
+        useChatStore.getState().applyToolActivity({
+            session_id: activeSessionId,
+            tool_call_id: "tool-later-tracked",
+            title: "Edit file again",
+            kind: "edit",
+            status: "completed",
+            diffs: [
+                {
+                    path: "/notes/file.md",
+                    kind: "update",
+                    old_text: "base",
+                    new_text: "later tracked edit",
+                },
+            ],
+        });
+
+        const firstMessage =
+            useChatStore.getState().sessionsById[activeSessionId]!.messages.find(
+                (message) => message.id === "tool:tool-untracked-preview",
+            );
+        expect(firstMessage?.reviewDiffs).toEqual(firstMessage?.diffs);
+        expect(firstMessage?.reviewDiffs?.[0]).toMatchObject({
+            path: "/notes/file.md",
+            old_text: "opaque old",
+            new_text: "opaque preview",
+            reversible: false,
+        });
+    });
+
+    it("does not freeze a later non-trackable tool card from an earlier tracked edit on the same file", async () => {
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+
+        useChatStore.getState().applyToolActivity({
+            session_id: activeSessionId,
+            tool_call_id: "tool-earlier-tracked",
+            title: "Edit file",
+            kind: "edit",
+            status: "completed",
+            diffs: [
+                {
+                    path: "/notes/file.md",
+                    kind: "update",
+                    old_text: "tracked old",
+                    new_text: "tracked new",
+                },
+            ],
+        });
+
+        useChatStore.getState().applyToolActivity({
+            session_id: activeSessionId,
+            tool_call_id: "tool-later-untracked-preview",
+            title: "Edit file again",
+            kind: "edit",
+            status: "completed",
+            diffs: [
+                {
+                    path: "/notes/file.md",
+                    kind: "update",
+                    old_text: "opaque old",
+                    new_text: "opaque preview",
+                    reversible: false,
+                },
+            ],
+        });
+
+        const laterMessage =
+            useChatStore.getState().sessionsById[activeSessionId]!.messages.find(
+                (message) => message.id === "tool:tool-later-untracked-preview",
+            );
+        expect(laterMessage?.reviewDiffs).toEqual(laterMessage?.diffs);
+        expect(laterMessage?.reviewDiffs?.[0]).toMatchObject({
+            path: "/notes/file.md",
+            old_text: "opaque old",
+            new_text: "opaque preview",
+            reversible: false,
+        });
     });
 
     it("keeps earlier agent hunks rejectable when the user edits the file and the agent edits it again later", async () => {

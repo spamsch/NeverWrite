@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -15,6 +15,12 @@ use crate::{AiFileDiffHunkPayload, AiFileDiffPayload};
 const FILE_DELETED_PLACEHOLDER: &str = "[file deleted]";
 const ACP_DIFF_PREVIOUS_PATH_KEY: &str = "neverwritePreviousPath";
 const ACP_DIFF_HUNKS_KEY: &str = "neverwriteHunks";
+const CLAUDE_CODE_META_KEY: &str = "claudeCode";
+const CLAUDE_CODE_TOOL_NAME_KEY: &str = "toolName";
+const CLAUDE_CODE_TOOL_RESPONSE_KEY: &str = "toolResponse";
+const CLAUDE_CODE_STRUCTURED_PATCH_KEY: &str = "structuredPatch";
+const CLAUDE_CODE_FILE_PATH_KEY: &str = "filePath";
+const CLAUDE_NO_NEWLINE_MARKER: &str = "\\ No newline at end of file";
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolDiffState {
@@ -187,10 +193,17 @@ impl ToolDiffState {
             return;
         };
 
+        let key = call_key(session_id, tool_call_id);
+        let diffs = vec![diff];
         if let Ok(mut guard) = self.write_diffs.lock() {
-            guard
-                .entry(call_key(session_id, tool_call_id))
-                .or_insert(vec![diff]);
+            let Some(existing) = guard.get(&key).cloned() else {
+                guard.insert(key, diffs);
+                return;
+            };
+
+            if let Some(merged) = reconcile_cached_diffs(&existing, &diffs) {
+                guard.insert(key, merged);
+            }
         }
     }
 
@@ -203,24 +216,13 @@ impl ToolDiffState {
 
         let key = call_key(session_id, &tool_call.tool_call_id.0);
         if let Ok(mut guard) = self.write_diffs.lock() {
-            let has_old_text = diffs.iter().any(|diff| diff.old_text.is_some());
-            let existing_is_reliable = guard
-                .get(&key)
-                .map(|cached| {
-                    cached
-                        .iter()
-                        .any(|diff| diff.old_text.is_some() && diff.reversible)
-                })
-                .unwrap_or(false);
-
-            if existing_is_reliable {
-                return;
-            }
-
-            if has_old_text {
+            let Some(existing) = guard.get(&key).cloned() else {
                 guard.insert(key, diffs);
-            } else {
-                guard.entry(key).or_insert(diffs);
+                return;
+            };
+
+            if let Some(merged) = reconcile_cached_diffs(&existing, &diffs) {
+                guard.insert(key, merged);
             }
         }
     }
@@ -362,6 +364,30 @@ struct ReadToolInput {
     file_path: String,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeStructuredPatchHunk {
+    old_start: usize,
+    old_lines: usize,
+    new_start: usize,
+    new_lines: usize,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeStructuredPatchDiffCandidate {
+    hunk: ClaudeStructuredPatchHunk,
+    new_text: String,
+    old_text: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DiffCacheQuality {
+    Weak,
+    ReliableSnapshot,
+    Anchored,
+}
+
 enum ExistingTextSnapshot {
     Missing,
     Text(String),
@@ -369,12 +395,25 @@ enum ExistingTextSnapshot {
 }
 
 pub fn collect_tool_call_diffs(tool_call: &ToolCall, cwd: Option<&Path>) -> Vec<AiFileDiffPayload> {
+    // Claude emits structuredPatch in tool-call meta, while the display diffs
+    // remain regular ToolCallContent::Diff entries. Match them by path + text.
+    let anchored_hunks_by_content_index = build_claude_structured_patch_hunks_by_content_index(
+        &tool_call.content,
+        tool_call.meta.as_ref(),
+        cwd,
+    );
+
     tool_call
         .content
         .iter()
-        .filter_map(|item| match item {
+        .enumerate()
+        .filter_map(|(content_index, item)| match item {
             ToolCallContent::Diff(diff) => {
-                Some(map_diff_payload(diff, tool_call.raw_input.as_ref(), cwd))
+                let mut payload = map_diff_payload(diff, tool_call.raw_input.as_ref(), cwd);
+                if let Some(hunks) = anchored_hunks_by_content_index.get(&content_index) {
+                    payload.hunks = Some(hunks.clone());
+                }
+                Some(payload)
             }
             _ => None,
         })
@@ -406,6 +445,415 @@ fn edit_tool_input(raw_input: Option<&serde_json::Value>) -> Option<EditToolInpu
 
 fn read_tool_input(raw_input: Option<&serde_json::Value>) -> Option<ReadToolInput> {
     serde_json::from_value(raw_input?.clone()).ok()
+}
+
+fn diff_cache_quality(diffs: &[AiFileDiffPayload]) -> DiffCacheQuality {
+    diffs
+        .iter()
+        .map(diff_payload_quality)
+        .max()
+        .unwrap_or(DiffCacheQuality::Weak)
+}
+
+fn diff_payload_quality(diff: &AiFileDiffPayload) -> DiffCacheQuality {
+    if diff.hunks.as_ref().is_some_and(|hunks| !hunks.is_empty()) {
+        return DiffCacheQuality::Anchored;
+    }
+
+    if diff.old_text.is_some() && diff.reversible {
+        return DiffCacheQuality::ReliableSnapshot;
+    }
+
+    DiffCacheQuality::Weak
+}
+
+fn reconcile_cached_diffs(
+    existing: &[AiFileDiffPayload],
+    incoming: &[AiFileDiffPayload],
+) -> Option<Vec<AiFileDiffPayload>> {
+    let incoming_quality = diff_cache_quality(incoming);
+    let existing_quality = diff_cache_quality(existing);
+
+    if incoming_quality == DiffCacheQuality::ReliableSnapshot
+        && existing_quality == DiffCacheQuality::Anchored
+    {
+        // Full snapshots are the canonical accept/reject text. Existing exact
+        // hunks are presentation metadata, so keep them only when they still
+        // match inside the incoming snapshot.
+        return Some(merge_anchored_hunks_into_cached_diffs(incoming, existing));
+    }
+
+    if incoming_quality == DiffCacheQuality::Anchored
+        && should_merge_anchored_diffs_into_cached(existing, incoming)
+    {
+        return Some(merge_anchored_hunks_into_cached_diffs(existing, incoming));
+    }
+
+    if incoming_quality == DiffCacheQuality::Anchored
+        && existing_quality >= DiffCacheQuality::ReliableSnapshot
+    {
+        // If we cannot safely attach the anchored metadata onto the canonical
+        // snapshot, keep the existing full-text diff intact.
+        return None;
+    }
+
+    // Exact anchored hunks are review metadata and must not be blocked by an
+    // earlier weaker diff, but full-text snapshots still own the canonical
+    // old/new text used for accept/reject safety.
+    if incoming_quality > existing_quality
+        || (incoming_quality == DiffCacheQuality::Anchored
+            && existing_quality == DiffCacheQuality::Anchored)
+    {
+        return Some(incoming.to_vec());
+    }
+
+    None
+}
+
+fn merge_anchored_hunks_into_cached_diffs(
+    cached: &[AiFileDiffPayload],
+    anchored: &[AiFileDiffPayload],
+) -> Vec<AiFileDiffPayload> {
+    let mut next = cached.to_vec();
+
+    for incoming in anchored {
+        let Some(incoming_hunks) = incoming.hunks.as_ref().filter(|hunks| !hunks.is_empty()) else {
+            continue;
+        };
+
+        let Some(cached_diff) = next.iter_mut().find(|candidate| {
+            candidate.path == incoming.path
+                && candidate.previous_path == incoming.previous_path
+                && cached_diff_contains_incoming_snippet(candidate, incoming)
+        }) else {
+            continue;
+        };
+
+        let merged_hunks =
+            merge_unique_hunks(cached_diff.hunks.as_deref().unwrap_or(&[]), incoming_hunks);
+        cached_diff.hunks = (!merged_hunks.is_empty()).then_some(merged_hunks);
+    }
+
+    next
+}
+
+fn should_merge_anchored_diffs_into_cached(
+    cached: &[AiFileDiffPayload],
+    anchored: &[AiFileDiffPayload],
+) -> bool {
+    anchored
+        .iter()
+        .filter(|incoming| {
+            incoming
+                .hunks
+                .as_ref()
+                .is_some_and(|hunks| !hunks.is_empty())
+        })
+        .all(|incoming| {
+            cached.iter().any(|candidate| {
+                candidate.path == incoming.path
+                    && candidate.previous_path == incoming.previous_path
+                    && cached_diff_contains_incoming_snippet(candidate, incoming)
+            })
+        })
+}
+
+fn cached_diff_contains_incoming_snippet(
+    cached: &AiFileDiffPayload,
+    incoming: &AiFileDiffPayload,
+) -> bool {
+    let old_matches = match (cached.old_text.as_deref(), incoming.old_text.as_deref()) {
+        (_, None) => true,
+        (Some(cached_text), Some(incoming_text)) => cached_text.contains(incoming_text),
+        (None, Some(_)) => false,
+    };
+    let new_matches = match (cached.new_text.as_deref(), incoming.new_text.as_deref()) {
+        (_, None) => true,
+        (Some(cached_text), Some(incoming_text)) => cached_text.contains(incoming_text),
+        (None, Some(_)) => false,
+    };
+
+    old_matches && new_matches
+}
+
+fn merge_unique_hunks(
+    existing: &[AiFileDiffHunkPayload],
+    incoming: &[AiFileDiffHunkPayload],
+) -> Vec<AiFileDiffHunkPayload> {
+    let mut merged = existing.to_vec();
+
+    for hunk in incoming {
+        if !merged.iter().any(|candidate| candidate == hunk) {
+            merged.push(hunk.clone());
+        }
+    }
+
+    merged
+}
+
+fn build_claude_structured_patch_hunks_by_content_index(
+    content: &[ToolCallContent],
+    meta: Option<&Meta>,
+    cwd: Option<&Path>,
+) -> HashMap<usize, Vec<AiFileDiffHunkPayload>> {
+    let candidates = read_claude_structured_patch_diff_candidates(meta, cwd);
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut anchored_hunks_by_content_index = HashMap::new();
+    let mut used_candidate_indexes = HashSet::new();
+
+    for (content_index, entry) in content.iter().enumerate() {
+        let ToolCallContent::Diff(diff) = entry else {
+            continue;
+        };
+
+        let path = to_display_path(&diff.path, cwd);
+        let old_text = diff.old_text.as_deref();
+        let candidate_index = candidates
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                if used_candidate_indexes.contains(&index)
+                    || candidate.path != path
+                    || !claude_old_text_matches(candidate.old_text.as_deref(), old_text)
+                    || !claude_new_text_matches(&candidate.new_text, &diff.new_text)
+                {
+                    return None;
+                }
+
+                Some(index)
+            });
+
+        let Some(candidate_index) = candidate_index else {
+            continue;
+        };
+
+        used_candidate_indexes.insert(candidate_index);
+        let candidate = &candidates[candidate_index];
+        if let Some(hunks) = claude_structured_patch_to_ai_diff_hunks(&[candidate.hunk.clone()]) {
+            anchored_hunks_by_content_index.insert(content_index, hunks);
+        }
+    }
+
+    anchored_hunks_by_content_index
+}
+
+fn read_claude_structured_patch_diff_candidates(
+    meta: Option<&Meta>,
+    cwd: Option<&Path>,
+) -> Vec<ClaudeStructuredPatchDiffCandidate> {
+    let Some(claude_code) = meta
+        .and_then(|meta| meta.get(CLAUDE_CODE_META_KEY))
+        .and_then(|value| value.as_object())
+    else {
+        return Vec::new();
+    };
+
+    let tool_name = claude_code
+        .get(CLAUDE_CODE_TOOL_NAME_KEY)
+        .and_then(|value| value.as_str());
+    if !matches!(tool_name, Some("Edit" | "Write")) {
+        return Vec::new();
+    }
+
+    let Some(tool_response) = claude_code
+        .get(CLAUDE_CODE_TOOL_RESPONSE_KEY)
+        .and_then(|value| value.as_object())
+    else {
+        return Vec::new();
+    };
+
+    let Some(file_path) = tool_response
+        .get(CLAUDE_CODE_FILE_PATH_KEY)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let Some(structured_patch) = tool_response
+        .get(CLAUDE_CODE_STRUCTURED_PATCH_KEY)
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let path = to_display_path(&resolve_tool_path(file_path, cwd), cwd);
+    structured_patch
+        .iter()
+        .filter_map(|candidate| {
+            let hunk = read_claude_structured_patch_hunk(candidate)?;
+            let (old_text, new_text) = claude_structured_patch_hunk_to_diff_texts(&hunk)?;
+            Some(ClaudeStructuredPatchDiffCandidate {
+                hunk,
+                new_text,
+                old_text,
+                path: path.clone(),
+            })
+        })
+        .collect()
+}
+
+fn read_claude_structured_patch_hunk(
+    candidate: &serde_json::Value,
+) -> Option<ClaudeStructuredPatchHunk> {
+    let candidate = candidate.as_object()?;
+    let old_start = read_finite_usize(candidate.get("oldStart")?, 0)?;
+    let old_lines = read_finite_usize(candidate.get("oldLines")?, 0)?;
+    let new_start = read_finite_usize(candidate.get("newStart")?, 0)?;
+    let new_lines = read_finite_usize(candidate.get("newLines")?, 0)?;
+    let lines = candidate
+        .get("lines")?
+        .as_array()?
+        .iter()
+        .filter_map(|line| line.as_str().map(str::to_string))
+        .collect();
+
+    Some(ClaudeStructuredPatchHunk {
+        old_start,
+        old_lines,
+        new_start,
+        new_lines,
+        lines,
+    })
+}
+
+fn read_finite_usize(value: &serde_json::Value, minimum: usize) -> Option<usize> {
+    let number = value.as_f64()?;
+    if !number.is_finite() {
+        return None;
+    }
+
+    let clamped = number.trunc().max(minimum as f64);
+    if clamped > usize::MAX as f64 {
+        return None;
+    }
+
+    Some(clamped as usize)
+}
+
+fn claude_structured_patch_hunk_to_diff_texts(
+    hunk: &ClaudeStructuredPatchHunk,
+) -> Option<(Option<String>, String)> {
+    let mut old_text = Vec::new();
+    let mut new_text = Vec::new();
+
+    for line in &hunk.lines {
+        if claude_structured_patch_marker_matches(line) {
+            continue;
+        }
+
+        if let Some(text) = line.strip_prefix('-') {
+            old_text.push(text.to_string());
+        } else if let Some(text) = line.strip_prefix('+') {
+            new_text.push(text.to_string());
+        } else {
+            let text = strip_first_char(line).to_string();
+            old_text.push(text.clone());
+            new_text.push(text);
+        }
+    }
+
+    if old_text.is_empty() && new_text.is_empty() {
+        return None;
+    }
+
+    let old_text = old_text.join("\n");
+    let new_text = new_text.join("\n");
+    Some(((!old_text.is_empty()).then_some(old_text), new_text))
+}
+
+fn claude_structured_patch_marker_matches(line: &str) -> bool {
+    line == CLAUDE_NO_NEWLINE_MARKER
+}
+
+fn claude_diff_text_marker_matches(line: &str) -> bool {
+    claude_structured_patch_marker_matches(line)
+        || line
+            == CLAUDE_NO_NEWLINE_MARKER
+                .strip_prefix('\\')
+                .unwrap_or(CLAUDE_NO_NEWLINE_MARKER)
+}
+
+fn strip_claude_no_newline_marker_lines(text: &str) -> String {
+    text.split('\n')
+        .filter(|line| !claude_diff_text_marker_matches(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_claude_old_text(text: Option<&str>) -> Option<String> {
+    let normalized = strip_claude_no_newline_marker_lines(text?);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn claude_old_text_matches(candidate: Option<&str>, actual: Option<&str>) -> bool {
+    candidate == actual || normalize_claude_old_text(candidate) == normalize_claude_old_text(actual)
+}
+
+fn claude_new_text_matches(candidate: &str, actual: &str) -> bool {
+    candidate == actual
+        || strip_claude_no_newline_marker_lines(candidate)
+            == strip_claude_no_newline_marker_lines(actual)
+}
+
+fn claude_structured_patch_to_ai_diff_hunks(
+    structured_patch: &[ClaudeStructuredPatchHunk],
+) -> Option<Vec<AiFileDiffHunkPayload>> {
+    let hunks = structured_patch
+        .iter()
+        .filter_map(|hunk| {
+            let lines: Vec<_> = hunk
+                .lines
+                .iter()
+                .filter_map(|raw_line| {
+                    if claude_structured_patch_marker_matches(raw_line) {
+                        return None;
+                    }
+
+                    let (line_type, text) = if let Some(text) = raw_line.strip_prefix('+') {
+                        ("add", text.to_string())
+                    } else if let Some(text) = raw_line.strip_prefix('-') {
+                        ("remove", text.to_string())
+                    } else if let Some(text) = raw_line.strip_prefix(' ') {
+                        ("context", text.to_string())
+                    } else {
+                        ("context", raw_line.clone())
+                    };
+
+                    Some(crate::AiFileDiffHunkLinePayload {
+                        r#type: line_type.to_string(),
+                        text,
+                    })
+                })
+                .collect();
+
+            if lines.is_empty() {
+                return None;
+            }
+
+            Some(AiFileDiffHunkPayload {
+                old_start: hunk.old_start,
+                old_count: hunk.old_lines,
+                new_start: hunk.new_start,
+                new_count: hunk.new_lines,
+                lines,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    (!hunks.is_empty()).then_some(hunks)
+}
+
+fn strip_first_char(value: &str) -> &str {
+    let Some((first_index, _)) = value.char_indices().nth(1) else {
+        return "";
+    };
+
+    &value[first_index..]
 }
 
 fn is_edit_tool_input(raw_input: Option<&serde_json::Value>) -> bool {
@@ -649,7 +1097,10 @@ fn map_diff_payload(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use agent_client_protocol::schema::{
         Content, Diff, Meta, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
@@ -658,12 +1109,15 @@ mod tests {
 
     use super::*;
 
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
     fn unique_temp_dir() -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("neverwrite-tool-diffs-{suffix}"))
+        let counter = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("neverwrite-tool-diffs-{suffix}-{counter}"))
     }
 
     #[test]
@@ -725,6 +1179,558 @@ mod tests {
         let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
         assert_eq!(hunk.old_start, 1);
         assert_eq!(hunk.lines.len(), 2);
+    }
+
+    #[test]
+    fn claude_structured_patch_attaches_anchored_hunks_to_matching_content_diff() {
+        let mut call = ToolCall::new(ToolCallId::from("tool-1"), "Edit file")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/app.ts", "alpha\nnew\nomega").old_text("alpha\nold\nomega"),
+            )]);
+        call.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Edit",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 12,
+                            "oldLines": 3,
+                            "newStart": 12,
+                            "newLines": 3,
+                            "lines": [
+                                " alpha",
+                                "-old",
+                                "+new",
+                                " omega"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let diffs = collect_tool_call_diffs(&call, None);
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].old_text.as_deref(), Some("alpha\nold\nomega"));
+        assert_eq!(diffs[0].new_text.as_deref(), Some("alpha\nnew\nomega"));
+        let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
+        assert_eq!((hunk.old_start, hunk.new_start), (12, 12));
+        assert_eq!((hunk.old_count, hunk.new_count), (3, 3));
+        assert_eq!(hunk.lines[0].r#type, "context");
+        assert_eq!(hunk.lines[0].text, "alpha");
+        assert_eq!(hunk.lines[1].r#type, "remove");
+        assert_eq!(hunk.lines[1].text, "old");
+        assert_eq!(hunk.lines[2].r#type, "add");
+        assert_eq!(hunk.lines[2].text, "new");
+    }
+
+    #[test]
+    fn claude_structured_patch_preserves_zero_start_lines_for_creation_hunks() {
+        let mut call = ToolCall::new(ToolCallId::from("tool-1"), "Write file")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(Diff::new(
+                "src/new.ts",
+                "first line",
+            ))]);
+        call.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Write",
+                "toolResponse": {
+                    "filePath": "src/new.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 0,
+                            "oldLines": 0,
+                            "newStart": 0,
+                            "newLines": 1,
+                            "lines": [
+                                "+first line"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let diffs = collect_tool_call_diffs(&call, None);
+
+        let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
+        assert_eq!((hunk.old_start, hunk.new_start), (0, 0));
+        assert_eq!((hunk.old_count, hunk.new_count), (0, 1));
+        assert_eq!(hunk.lines[0].r#type, "add");
+        assert_eq!(hunk.lines[0].text, "first line");
+    }
+
+    #[test]
+    fn claude_structured_patch_ignores_no_newline_marker_when_matching_content_diff() {
+        let mut call = ToolCall::new(ToolCallId::from("tool-1"), "Edit file")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/app.ts", "new").old_text("old"),
+            )]);
+        call.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Edit",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 1,
+                            "oldLines": 1,
+                            "newStart": 1,
+                            "newLines": 1,
+                            "lines": [
+                                "-old",
+                                "+new",
+                                "\\ No newline at end of file"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let diffs = collect_tool_call_diffs(&call, None);
+
+        let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
+        assert_eq!((hunk.old_start, hunk.new_start), (1, 1));
+        assert_eq!(hunk.lines.len(), 2);
+        assert_eq!(hunk.lines[0].text, "old");
+        assert_eq!(hunk.lines[1].text, "new");
+    }
+
+    #[test]
+    fn claude_structured_patch_matches_content_diff_with_stripped_no_newline_marker() {
+        let mut call = ToolCall::new(ToolCallId::from("tool-1"), "Edit file")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/app.ts", "new\n No newline at end of file")
+                    .old_text("old\n No newline at end of file"),
+            )]);
+        call.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Edit",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 1,
+                            "oldLines": 1,
+                            "newStart": 1,
+                            "newLines": 1,
+                            "lines": [
+                                "-old",
+                                "+new",
+                                "\\ No newline at end of file"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let diffs = collect_tool_call_diffs(&call, None);
+
+        let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
+        assert_eq!((hunk.old_start, hunk.new_start), (1, 1));
+        assert_eq!(hunk.lines.len(), 2);
+        assert_eq!(hunk.lines[0].text, "old");
+        assert_eq!(hunk.lines[1].text, "new");
+    }
+
+    #[test]
+    fn claude_structured_patch_preserves_context_line_named_like_no_newline_marker() {
+        let mut call = ToolCall::new(ToolCallId::from("tool-1"), "Edit file")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/app.ts", "No newline at end of file\nnew")
+                    .old_text("No newline at end of file\nold"),
+            )]);
+        call.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Edit",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 1,
+                            "oldLines": 2,
+                            "newStart": 1,
+                            "newLines": 2,
+                            "lines": [
+                                " No newline at end of file",
+                                "-old",
+                                "+new"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let diffs = collect_tool_call_diffs(&call, None);
+
+        let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
+        assert_eq!(hunk.lines.len(), 3);
+        assert_eq!(hunk.lines[0].r#type, "context");
+        assert_eq!(hunk.lines[0].text, "No newline at end of file");
+        assert_eq!(hunk.lines[1].text, "old");
+        assert_eq!(hunk.lines[2].text, "new");
+    }
+
+    #[test]
+    fn claude_structured_patch_matches_multiple_identical_content_diffs_by_position() {
+        let mut call = ToolCall::new(ToolCallId::from("tool-1"), "Edit all matches")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![
+                ToolCallContent::Diff(Diff::new("src/app.ts", "newValue").old_text("oldValue")),
+                ToolCallContent::Diff(Diff::new("src/app.ts", "newValue").old_text("oldValue")),
+            ]);
+        call.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Edit",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 3,
+                            "oldLines": 1,
+                            "newStart": 3,
+                            "newLines": 1,
+                            "lines": [
+                                "-oldValue",
+                                "+newValue"
+                            ]
+                        },
+                        {
+                            "oldStart": 15,
+                            "oldLines": 1,
+                            "newStart": 15,
+                            "newLines": 1,
+                            "lines": [
+                                "-oldValue",
+                                "+newValue"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let diffs = collect_tool_call_diffs(&call, None);
+
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(
+            diffs
+                .iter()
+                .map(|diff| {
+                    let hunk = diff.hunks.as_ref().unwrap().first().unwrap();
+                    (hunk.old_start, hunk.new_start)
+                })
+                .collect::<Vec<_>>(),
+            vec![(3, 3), (15, 15)]
+        );
+    }
+
+    #[test]
+    fn claude_structured_patch_update_attaches_hunks_to_cached_snapshot_diff() {
+        let state = ToolDiffState::default();
+        state.register_file_baseline(
+            "session-1",
+            "src/app.ts",
+            "header\nalpha\nold\nomega\nfooter".to_string(),
+        );
+
+        let initial = ToolCall::new(ToolCallId::from("tool-write"), "Write app.ts")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "file_path": "src/app.ts",
+                "content": "header\nalpha\nnew\nomega\nfooter",
+            }));
+        let initial = state.upsert_tool_call("session-1", initial);
+        let initial_diffs = state.normalized_diffs_for_tool_call("session-1", &initial);
+        assert_eq!(
+            initial_diffs[0].old_text.as_deref(),
+            Some("header\nalpha\nold\nomega\nfooter")
+        );
+        assert!(initial_diffs[0].hunks.is_none());
+
+        let mut update = ToolCallUpdate::new(
+            "tool-write",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![ToolCallContent::Diff(
+                    Diff::new("src/app.ts", "alpha\nnew\nomega").old_text("alpha\nold\nomega"),
+                )]),
+        );
+        update.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Write",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 2,
+                            "oldLines": 3,
+                            "newStart": 2,
+                            "newLines": 3,
+                            "lines": [
+                                " alpha",
+                                "-old",
+                                "+new",
+                                " omega"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let completed = state.apply_tool_update("session-1", update).unwrap();
+        let diffs = state.normalized_diffs_for_tool_call("session-1", &completed);
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].old_text.as_deref(),
+            Some("header\nalpha\nold\nomega\nfooter")
+        );
+        assert_eq!(
+            diffs[0].new_text.as_deref(),
+            Some("header\nalpha\nnew\nomega\nfooter")
+        );
+        let hunk = diffs[0].hunks.as_ref().unwrap().first().unwrap();
+        assert_eq!((hunk.old_start, hunk.new_start), (2, 2));
+    }
+
+    #[test]
+    fn reliable_snapshot_replaces_prior_anchored_snippet_and_preserves_hunks() {
+        let state = ToolDiffState::default();
+        state.register_file_baseline(
+            "session-1",
+            "src/app.ts",
+            "header\nalpha\nold\nomega\nfooter".to_string(),
+        );
+
+        let mut anchored = ToolCall::new(ToolCallId::from("tool-write"), "Write app.ts")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Diff(
+                Diff::new("src/app.ts", "alpha\nnew\nomega").old_text("alpha\nold\nomega"),
+            )]);
+        anchored.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Write",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 2,
+                            "oldLines": 3,
+                            "newStart": 2,
+                            "newLines": 3,
+                            "lines": [
+                                " alpha",
+                                "-old",
+                                "+new",
+                                " omega"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+        let anchored = state.upsert_tool_call("session-1", anchored);
+        let anchored_diffs = state.normalized_diffs_for_tool_call("session-1", &anchored);
+        assert_eq!(
+            anchored_diffs[0].old_text.as_deref(),
+            Some("alpha\nold\nomega")
+        );
+
+        let snapshot_update = ToolCallUpdate::new(
+            "tool-write",
+            ToolCallUpdateFields::new().raw_input(serde_json::json!({
+                "file_path": "src/app.ts",
+                "content": "header\nalpha\nnew\nomega\nfooter",
+            })),
+        );
+
+        let completed = state
+            .apply_tool_update("session-1", snapshot_update)
+            .unwrap();
+        let diffs = state.normalized_diffs_for_tool_call("session-1", &completed);
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].old_text.as_deref(),
+            Some("header\nalpha\nold\nomega\nfooter")
+        );
+        assert_eq!(
+            diffs[0].new_text.as_deref(),
+            Some("header\nalpha\nnew\nomega\nfooter")
+        );
+        let hunks = diffs[0].hunks.as_ref().unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!((hunks[0].old_start, hunks[0].new_start), (2, 2));
+    }
+
+    #[test]
+    fn repeated_claude_structured_patch_updates_preserve_full_snapshot_and_deduplicate_hunks() {
+        let state = ToolDiffState::default();
+        state.register_file_baseline(
+            "session-1",
+            "src/app.ts",
+            "header\nalpha\nold\nomega\nfooter".to_string(),
+        );
+
+        let initial = ToolCall::new(ToolCallId::from("tool-write"), "Write app.ts")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "file_path": "src/app.ts",
+                "content": "header\nalpha\nnew\nomega\nfooter",
+            }));
+        state.upsert_tool_call("session-1", initial);
+
+        let make_update = || {
+            let mut update = ToolCallUpdate::new(
+                "tool-write",
+                ToolCallUpdateFields::new()
+                    .status(ToolCallStatus::Completed)
+                    .content(vec![ToolCallContent::Diff(
+                        Diff::new("src/app.ts", "alpha\nnew\nomega").old_text("alpha\nold\nomega"),
+                    )]),
+            );
+            update.meta = Some(Meta::from_iter([(
+                CLAUDE_CODE_META_KEY.to_string(),
+                serde_json::json!({
+                    "toolName": "Write",
+                    "toolResponse": {
+                        "filePath": "src/app.ts",
+                        "structuredPatch": [
+                            {
+                                "oldStart": 2,
+                                "oldLines": 3,
+                                "newStart": 2,
+                                "newLines": 3,
+                                "lines": [
+                                    " alpha",
+                                    "-old",
+                                    "+new",
+                                    " omega"
+                                ]
+                            }
+                        ]
+                    }
+                }),
+            )]));
+            update
+        };
+
+        let first = state.apply_tool_update("session-1", make_update()).unwrap();
+        let second = state.apply_tool_update("session-1", make_update()).unwrap();
+        let diffs = state.normalized_diffs_for_tool_call("session-1", &second);
+
+        assert_eq!(first.tool_call_id.0, second.tool_call_id.0);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].old_text.as_deref(),
+            Some("header\nalpha\nold\nomega\nfooter")
+        );
+        assert_eq!(
+            diffs[0].new_text.as_deref(),
+            Some("header\nalpha\nnew\nomega\nfooter")
+        );
+        let hunks = diffs[0].hunks.as_ref().unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), 4);
+    }
+
+    #[test]
+    fn unmatched_claude_structured_patch_update_preserves_cached_full_snapshot() {
+        let state = ToolDiffState::default();
+        state.register_file_baseline(
+            "session-1",
+            "src/app.ts",
+            "header\nalpha\nold\nomega\nfooter".to_string(),
+        );
+
+        let initial = ToolCall::new(ToolCallId::from("tool-write"), "Write app.ts")
+            .kind(ToolKind::Edit)
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({
+                "file_path": "src/app.ts",
+                "content": "header\nalpha\nnew\nomega\nfooter",
+            }));
+        let initial = state.upsert_tool_call("session-1", initial);
+        let initial_diffs = state.normalized_diffs_for_tool_call("session-1", &initial);
+        assert_eq!(
+            initial_diffs[0].old_text.as_deref(),
+            Some("header\nalpha\nold\nomega\nfooter")
+        );
+        assert!(initial_diffs[0].hunks.is_none());
+
+        let mut update = ToolCallUpdate::new(
+            "tool-write",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![ToolCallContent::Diff(
+                    Diff::new("src/app.ts", "different\nsnippet").old_text("different\nsource"),
+                )]),
+        );
+        update.meta = Some(Meta::from_iter([(
+            CLAUDE_CODE_META_KEY.to_string(),
+            serde_json::json!({
+                "toolName": "Write",
+                "toolResponse": {
+                    "filePath": "src/app.ts",
+                    "structuredPatch": [
+                        {
+                            "oldStart": 20,
+                            "oldLines": 2,
+                            "newStart": 20,
+                            "newLines": 2,
+                            "lines": [
+                                " different",
+                                "-source",
+                                "+snippet"
+                            ]
+                        }
+                    ]
+                }
+            }),
+        )]));
+
+        let completed = state.apply_tool_update("session-1", update).unwrap();
+        let diffs = state.normalized_diffs_for_tool_call("session-1", &completed);
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(
+            diffs[0].old_text.as_deref(),
+            Some("header\nalpha\nold\nomega\nfooter")
+        );
+        assert_eq!(
+            diffs[0].new_text.as_deref(),
+            Some("header\nalpha\nnew\nomega\nfooter")
+        );
+        assert!(diffs[0].hunks.is_none());
     }
 
     #[test]

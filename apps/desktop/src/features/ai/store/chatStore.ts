@@ -64,6 +64,7 @@ import {
 } from "./editedFilesBufferModel";
 import {
     applyNonConflictingEdits,
+    buildPatchFromTexts,
     computeRestoreAction,
     consolidateTrackedFiles,
     emptyActionLogState,
@@ -108,6 +109,8 @@ import {
     type AIChatMessage,
     type AIChatMessageKind,
     type AIFileDiff,
+    type AIFileDiffHunk,
+    type AIFileDiffHunkLine,
     type AIChatNoteSummary,
     type AIChatRole,
     type AIChatSession,
@@ -3777,6 +3780,166 @@ function replaceTextExactlyOnce(
     );
 }
 
+function countLinesBeforeOffset(text: string, offset: number) {
+    if (offset <= 0) return 0;
+    let lineCount = 0;
+    const boundedOffset = Math.min(offset, text.length);
+    for (let index = 0; index < boundedOffset; index += 1) {
+        if (text.charCodeAt(index) === 10) {
+            lineCount += 1;
+        }
+    }
+    return lineCount;
+}
+
+function getHunkSideLines(
+    hunk: AIFileDiffHunk,
+    side: "old" | "new",
+): string[] {
+    return hunk.lines
+        .filter((line) =>
+            side === "old" ? line.type !== "add" : line.type !== "remove",
+        )
+        .map((line) => line.text);
+}
+
+function hunkSideMatchesText(
+    text: string,
+    hunk: AIFileDiffHunk,
+    side: "old" | "new",
+) {
+    const expectedLines = getHunkSideLines(hunk, side);
+    if (expectedLines.length === 0) {
+        return true;
+    }
+
+    const start = side === "old" ? hunk.old_start : hunk.new_start;
+    if (start <= 0) {
+        return false;
+    }
+
+    const actualLines = text.split("\n").slice(start - 1);
+    return expectedLines.every((line, index) => actualLines[index] === line);
+}
+
+function hunkMatchesTexts(
+    hunk: AIFileDiffHunk,
+    oldText: string,
+    newText: string,
+) {
+    return (
+        hunkSideMatchesText(oldText, hunk, "old") &&
+        hunkSideMatchesText(newText, hunk, "new")
+    );
+}
+
+function shiftHunkStarts(
+    hunk: AIFileDiffHunk,
+    oldLineOffset: number,
+    newLineOffset: number,
+): AIFileDiffHunk {
+    return {
+        ...hunk,
+        old_start: hunk.old_start > 0 ? hunk.old_start + oldLineOffset : 0,
+        new_start: hunk.new_start > 0 ? hunk.new_start + newLineOffset : 0,
+    };
+}
+
+function deriveSnapshotDiffHunks(diff: AIFileDiff): AIFileDiffHunk[] {
+    if (
+        typeof diff.old_text !== "string" ||
+        typeof diff.new_text !== "string"
+    ) {
+        return [];
+    }
+
+    const patch = buildPatchFromTexts(diff.old_text, diff.new_text);
+    if (patchIsEmpty(patch)) {
+        return [];
+    }
+
+    const oldLines = diff.old_text.split("\n");
+    const newLines = diff.new_text.split("\n");
+    return patch.edits.map((edit) => {
+        const lines: AIFileDiffHunkLine[] = [];
+        for (let index = edit.oldStart; index < edit.oldEnd; index += 1) {
+            lines.push({ type: "remove", text: oldLines[index] ?? "" });
+        }
+        for (let index = edit.newStart; index < edit.newEnd; index += 1) {
+            lines.push({ type: "add", text: newLines[index] ?? "" });
+        }
+
+        return {
+            old_start: edit.oldStart + 1,
+            old_count: edit.oldEnd - edit.oldStart,
+            new_start: edit.newStart + 1,
+            new_count: edit.newEnd - edit.newStart,
+            lines,
+        };
+    });
+}
+
+function withDerivedSnapshotDiffHunks(diff: AIFileDiff): AIFileDiff {
+    if (diff.hunks && diff.hunks.length > 0) {
+        return diff;
+    }
+
+    const hunks = deriveSnapshotDiffHunks(diff);
+    return hunks.length > 0 ? { ...diff, hunks } : diff;
+}
+
+function normalizeFragmentHunksToSnapshot(
+    diff: AIFileDiff,
+    oldFragment: string,
+    newFragment: string,
+    oldSnapshot: string,
+    newSnapshot: string,
+    fragmentOffset: number,
+): AIFileDiff {
+    if (!diff.hunks || diff.hunks.length === 0) {
+        return withDerivedSnapshotDiffHunks(diff);
+    }
+
+    const oldLineOffset = countLinesBeforeOffset(oldSnapshot, fragmentOffset);
+    if (oldLineOffset === 0) {
+        return diff;
+    }
+
+    const newLineOffset = countLinesBeforeOffset(newSnapshot, fragmentOffset);
+    const rebasedHunks: AIFileDiffHunk[] = [];
+
+    for (const hunk of diff.hunks) {
+        const rebased = shiftHunkStarts(hunk, oldLineOffset, newLineOffset);
+        if (
+            hunkMatchesTexts(hunk, oldFragment, newFragment) &&
+            hunkMatchesTexts(rebased, oldSnapshot, newSnapshot)
+        ) {
+            rebasedHunks.push(rebased);
+            continue;
+        }
+
+        if (hunkMatchesTexts(hunk, oldSnapshot, newSnapshot)) {
+            rebasedHunks.push(hunk);
+            continue;
+        }
+
+        // A fragment hunk that cannot be reconciled with the full snapshot is
+        // less trustworthy than the snapshot itself. Re-derive display hunks
+        // from the normalized snapshot so large-file previews stay anchored.
+        return withDerivedSnapshotDiffHunks({
+            ...diff,
+            hunks: undefined,
+        });
+    }
+
+    return {
+        ...diff,
+        old_text: oldSnapshot,
+        new_text: newSnapshot,
+        hunks: rebasedHunks,
+    };
+}
+
 function findTrackedFileForIncomingDiff(
     files: Record<string, TrackedFile>,
     diff: AIFileDiff,
@@ -3873,6 +4036,7 @@ function normalizeIncomingTrackedDiff(
             continue;
         }
 
+        const fragmentOffset = candidate.indexOf(canonicalDiff.old_text);
         const reconstructed = replaceTextExactlyOnce(
             candidate,
             canonicalDiff.old_text,
@@ -3882,7 +4046,7 @@ function normalizeIncomingTrackedDiff(
             continue;
         }
 
-        return {
+        const normalizedDiff = {
             ...canonicalDiff,
             old_text: candidate,
             kind:
@@ -3897,6 +4061,15 @@ function normalizeIncomingTrackedDiff(
                       : reconstructed,
             reversible: true,
         };
+
+        return normalizeFragmentHunksToSnapshot(
+            normalizedDiff,
+            canonicalDiff.old_text,
+            nextFragment,
+            candidate,
+            normalizedDiff.new_text ?? "",
+            fragmentOffset,
+        );
     }
 
     return canonicalDiff;
@@ -3910,6 +4083,14 @@ function normalizeIncomingTrackedDiffs(
     return diffs.map((diff) =>
         normalizeIncomingTrackedDiff(diff, currentFiles, vaultPath),
     );
+}
+
+function freezeMessageReviewDiffs(messageDiffs: AIFileDiff[] | undefined) {
+    if (!messageDiffs || messageDiffs.length === 0) {
+        return undefined;
+    }
+
+    return messageDiffs;
 }
 
 function summarizeTrackedFileForDebug(file: TrackedFile | null | undefined) {
@@ -3995,16 +4176,15 @@ function consolidateActionLogDiffs(
     diffs: AIFileDiff[],
     workCycleId: string | null | undefined,
     timestamp = Date.now(),
+    options?: { normalized?: boolean },
 ): AIChatSession {
     if (!workCycleId || diffs.length === 0) return session;
     const actionLog = session.actionLog ?? emptyActionLogState();
     const currentFiles = getTrackedFilesForSession(actionLog);
     const vaultPath = session.vaultPath ?? useVaultStore.getState().vaultPath;
-    const normalizedDiffs = normalizeIncomingTrackedDiffs(
-        currentFiles,
-        diffs,
-        vaultPath,
-    );
+    const normalizedDiffs = options?.normalized
+        ? diffs
+        : normalizeIncomingTrackedDiffs(currentFiles, diffs, vaultPath);
     const nextFiles = consolidateTrackedFiles(
         currentFiles,
         normalizedDiffs,
@@ -5234,6 +5414,7 @@ function toPersistedHistory(session: AIChatSession): PersistedSessionHistory {
             permission_request_id: m.permissionRequestId,
             permission_options: m.permissionOptions,
             diffs: m.diffs,
+            review_diffs: m.reviewDiffs,
             user_input_request_id: m.userInputRequestId,
             user_input_questions: m.userInputQuestions,
             plan_entries: m.planEntries,
@@ -5622,6 +5803,7 @@ function restoreMessagesFromHistory(
         permissionRequestId: m.permission_request_id,
         permissionOptions: m.permission_options,
         diffs: m.diffs,
+        reviewDiffs: m.review_diffs,
         userInputRequestId: m.user_input_request_id,
         userInputQuestions: m.user_input_questions,
         planEntries: m.plan_entries,
@@ -7821,6 +8003,45 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     Boolean(workCycleId);
 
                 const messageId = `tool:${payload.tool_call_id}`;
+
+                // Consolidate diffs into ActionLog synchronously from the
+                // accumulated tracked-file state. Delayed precomputed patches
+                // are not allowed to rewrite the domain state.
+                let consolidated = nextSession;
+                let messageDiffs = payload.diffs;
+                let reviewVaultPath =
+                    consolidated.vaultPath ??
+                    useVaultStore.getState().vaultPath;
+                let reviewDiffs = freezeMessageReviewDiffs(messageDiffs);
+                if (shouldConsolidate) {
+                    consolidated = ensureActionLog(consolidated);
+                    const currentFiles = getTrackedFilesForSession(
+                        consolidated.actionLog,
+                    );
+                    reviewVaultPath =
+                        consolidated.vaultPath ??
+                        useVaultStore.getState().vaultPath;
+                    messageDiffs = normalizeIncomingTrackedDiffs(
+                        currentFiles,
+                        payload.diffs ?? [],
+                        reviewVaultPath,
+                    );
+                    consolidated = consolidateActionLogDiffs(
+                        consolidated,
+                        messageDiffs,
+                        workCycleId,
+                        eventTimestamp,
+                        { normalized: true },
+                    );
+                    if (!isSessionBusy(nextSession)) {
+                        consolidated = finalizeActionLogForWorkCycle(
+                            consolidated,
+                            workCycleId,
+                        );
+                    }
+                    reviewDiffs = freezeMessageReviewDiffs(messageDiffs);
+                }
+
                 const nextMessage: AIChatMessage = {
                     id: messageId,
                     role: "assistant",
@@ -7829,7 +8050,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     content: payload.summary ?? payload.title,
                     timestamp: eventTimestamp,
                     workCycleId: nextSession.activeWorkCycleId,
-                    diffs: payload.diffs,
+                    diffs: messageDiffs,
+                    reviewDiffs,
                     toolAction: payload.action ?? null,
                     meta: {
                         tool: payload.kind,
@@ -7837,26 +8059,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         target: payload.target ?? null,
                     },
                 };
-
-                // Consolidate diffs into ActionLog synchronously from the
-                // accumulated tracked-file state. Delayed precomputed patches
-                // are not allowed to rewrite the domain state.
-                let consolidated = nextSession;
-                if (shouldConsolidate) {
-                    consolidated = ensureActionLog(consolidated);
-                    consolidated = consolidateActionLogDiffs(
-                        consolidated,
-                        payload.diffs ?? [],
-                        workCycleId,
-                        eventTimestamp,
-                    );
-                    if (!isSessionBusy(nextSession)) {
-                        consolidated = finalizeActionLogForWorkCycle(
-                            consolidated,
-                            workCycleId,
-                        );
-                    }
-                }
 
                 return {
                     sessionsById: {
@@ -8058,14 +8260,32 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     payload.diffs.some(diffCanBeTracked) &&
                     Boolean(workCycleId);
                 let sessionWithBuffer = nextSession;
+                let messageDiffs = payload.diffs;
+                let reviewVaultPath =
+                    sessionWithBuffer.vaultPath ??
+                    useVaultStore.getState().vaultPath;
+                let reviewDiffs = freezeMessageReviewDiffs(messageDiffs);
                 if (hasDiffs) {
                     sessionWithBuffer = ensureActionLog(sessionWithBuffer);
+                    const currentFiles = getTrackedFilesForSession(
+                        sessionWithBuffer.actionLog,
+                    );
+                    reviewVaultPath =
+                        sessionWithBuffer.vaultPath ??
+                        useVaultStore.getState().vaultPath;
+                    messageDiffs = normalizeIncomingTrackedDiffs(
+                        currentFiles,
+                        payload.diffs,
+                        reviewVaultPath,
+                    );
                     sessionWithBuffer = consolidateActionLogDiffs(
                         sessionWithBuffer,
-                        payload.diffs,
+                        messageDiffs,
                         workCycleId,
                         eventTimestamp,
+                        { normalized: true },
                     );
+                    reviewDiffs = freezeMessageReviewDiffs(messageDiffs);
                 }
 
                 const messageId = `permission:${payload.request_id}`;
@@ -8079,7 +8299,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     workCycleId: nextSession.activeWorkCycleId,
                     permissionRequestId: payload.request_id,
                     permissionOptions: payload.options,
-                    diffs: payload.diffs.length > 0 ? payload.diffs : undefined,
+                    diffs: messageDiffs.length > 0 ? messageDiffs : undefined,
+                    reviewDiffs,
                     meta: {
                         status: "pending",
                         target: payload.target ?? null,
