@@ -33,6 +33,14 @@ interface DropdownFieldProps {
     onChange: (value: string) => void;
 }
 
+const SEARCHABLE_MODEL_RUNTIME_IDS = new Set(["kilo-acp", "opencode-acp"]);
+
+function shouldUseSearchableModelMenu(runtimeId?: string) {
+    return (
+        runtimeId !== undefined && SEARCHABLE_MODEL_RUNTIME_IDS.has(runtimeId)
+    );
+}
+
 function formatFallbackLabel(value: string) {
     if (value.trim().includes(" ")) {
         return value;
@@ -205,14 +213,15 @@ function DropdownField({
                                 }}
                                 placeholder={searchPlaceholder}
                                 aria-label={`${label} search`}
-                                className="mt-0.5 w-full rounded-md px-1.5 py-0.5 text-[8px]"
+                                className="mt-0.5 w-full rounded px-1 py-0 text-[7px]"
                                 style={{
                                     color: "var(--text-primary)",
                                     backgroundColor: "var(--bg-primary)",
                                     border: "1px solid var(--border)",
+                                    height: 16,
                                     outline: "none",
-                                    minHeight: 22,
-                                    lineHeight: 1.1,
+                                    minHeight: 16,
+                                    lineHeight: "12px",
                                 }}
                             />
                         </div>
@@ -387,9 +396,9 @@ export function AIChatAgentControls({
                 disabled={disabled}
                 label="Model"
                 value={selectedModelId}
-                searchable={runtimeId === "kilo-acp"}
-                searchPlaceholder="Select a model..."
-                emptySearchMessage="No Kilo models match that search."
+                searchable={shouldUseSearchableModelMenu(runtimeId)}
+                searchPlaceholder="Search models..."
+                emptySearchMessage="No models match that search."
                 options={
                     modelConfig
                         ? mapConfigOption(modelConfig)

@@ -1859,6 +1859,125 @@ describe("chatStore", () => {
         });
     });
 
+    it("treats OpenCode auth guidance as an authentication error", () => {
+        useChatStore.setState({
+            runtimes: [
+                {
+                    runtime: {
+                        ...runtimePayload[0].runtime,
+                        id: "opencode-acp",
+                        name: "OpenCode ACP",
+                    },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            setupStatusByRuntimeId: {
+                "opencode-acp": {
+                    ...readySetupStatusState,
+                    runtimeId: "opencode-acp",
+                    authMethod: "opencode-login",
+                    authMethods: [
+                        {
+                            id: "opencode-login",
+                            name: "OpenCode login",
+                            description:
+                                "Open the OpenCode CLI sign-in flow in an integrated terminal.",
+                        },
+                    ],
+                },
+            },
+            sessionsById: {
+                "opencode-session-1": {
+                    sessionId: "opencode-session-1",
+                    historySessionId: "opencode-session-1",
+                    runtimeId: "opencode-acp",
+                    modelId: "test-model",
+                    modeId: "default",
+                    status: "streaming",
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                    messages: [],
+                    attachments: [],
+                    runtimeState: "live",
+                },
+            },
+            selectedRuntimeId: "opencode-acp",
+        });
+
+        useChatStore.getState().applySessionError({
+            session_id: "opencode-session-1",
+            message: "Missing API key. Run `opencode auth login` or use /connect.",
+        });
+
+        expect(
+            useChatStore.getState().setupStatusByRuntimeId["opencode-acp"],
+        ).toMatchObject({
+            authReady: false,
+            authMethod: undefined,
+            onboardingRequired: true,
+            message: "You were signed out. Reconnect OpenCode to continue.",
+        });
+    });
+
+    it("does not treat a generic non-OpenCode 401 as an authentication error", () => {
+        useChatStore.setState({
+            runtimes: [
+                {
+                    runtime: { ...runtimePayload[0].runtime },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            setupStatusByRuntimeId: {
+                "codex-acp": {
+                    ...readySetupStatusState,
+                    runtimeId: "codex-acp",
+                    authReady: true,
+                    onboardingRequired: false,
+                },
+            },
+            sessionsById: {
+                "codex-session-1": {
+                    sessionId: "codex-session-1",
+                    historySessionId: "codex-session-1",
+                    runtimeId: "codex-acp",
+                    modelId: "test-model",
+                    modeId: "default",
+                    status: "streaming",
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                    messages: [],
+                    attachments: [],
+                    runtimeState: "live",
+                },
+            },
+            selectedRuntimeId: "codex-acp",
+        });
+
+        useChatStore.getState().applySessionError({
+            session_id: "codex-session-1",
+            message: "401 from a downstream document fetch",
+        });
+
+        expect(
+            useChatStore.getState().setupStatusByRuntimeId["codex-acp"],
+        ).toMatchObject({
+            authReady: true,
+            onboardingRequired: false,
+        });
+        expect(
+            useChatStore.getState().runtimeConnectionByRuntimeId["codex-acp"],
+        ).toMatchObject({
+            status: "error",
+            message: "401 from a downstream document fetch",
+        });
+    });
+
     it("shows provider quota errors as provider limits", () => {
         useChatStore.setState({
             runtimes: [

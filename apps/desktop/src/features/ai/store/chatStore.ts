@@ -1454,11 +1454,26 @@ function applyRuntimeSetupStatusPatch(
     };
 }
 
-function isAuthenticationErrorMessage(message: string) {
+function isAuthenticationErrorMessage(
+    message: string,
+    runtimeId?: string | null,
+) {
     const normalized = message.trim().toLowerCase();
+    const isOpenCodeRuntime = runtimeId === "opencode-acp";
+    const isOpenCodeAuthGuidance =
+        normalized.includes("run opencode auth login") ||
+        normalized.includes("use /connect") ||
+        (isOpenCodeRuntime &&
+            (normalized.includes("missing api key") ||
+                normalized.includes("no provider configured") ||
+                normalized.includes("unauthorized") ||
+                normalized.includes("401")));
+
     return (
         normalized.includes("auth_required") ||
         normalized.includes("authentication required") ||
+        normalized.includes("auth required") ||
+        isOpenCodeAuthGuidance ||
         normalized.includes("you were signed out") ||
         normalized.includes("reconnect in ai setup") ||
         normalized.includes("reconnect codex") ||
@@ -1499,7 +1514,7 @@ function isRuntimeSessionDisconnectedErrorMessage(message: string) {
     return normalized.includes("runtime session is not connected");
 }
 
-function normalizeAiErrorMessage(message: string) {
+function normalizeAiErrorMessage(message: string, runtimeId?: string | null) {
     if (message.includes("No hay vault abierto")) {
         return "Open a vault before starting a chat.";
     }
@@ -1512,7 +1527,7 @@ function normalizeAiErrorMessage(message: string) {
         return "Provider quota reached. Check your plan or wait until it resets.";
     }
 
-    if (isAuthenticationErrorMessage(message)) {
+    if (isAuthenticationErrorMessage(message, runtimeId)) {
         return "You were signed out. Reconnect in AI setup to continue chatting.";
     }
 
@@ -6571,7 +6586,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 session_id: activeSessionId,
                 message,
             });
-            if (isAuthenticationErrorMessage(message)) {
+            if (isAuthenticationErrorMessage(message, session.runtimeId)) {
                 await get().refreshSetupStatus(session.runtimeId);
             }
         }
@@ -7709,7 +7724,6 @@ export const useChatStore = create<ChatStore>((set, get) => {
         },
 
         applySessionError: ({ session_id, message: rawMessage }) => {
-            const message = normalizeAiErrorMessage(rawMessage);
             if (session_id) clearStaleStreamingCheck(session_id);
             set((state) => {
                 const sessionRuntimeId = session_id
@@ -7717,12 +7731,17 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     : null;
                 const effectiveRuntimeId =
                     sessionRuntimeId ?? getEffectiveRuntimeId(state);
+                const message = normalizeAiErrorMessage(
+                    rawMessage,
+                    effectiveRuntimeId,
+                );
                 const runtimeSetupStatus = getSetupStatusForRuntime(
                     state.setupStatusByRuntimeId,
                     effectiveRuntimeId,
                 );
                 const nextSetupStatusByRuntimeId =
-                    runtimeSetupStatus && isAuthenticationErrorMessage(message)
+                    runtimeSetupStatus &&
+                    isAuthenticationErrorMessage(message, effectiveRuntimeId)
                         ? {
                               ...state.setupStatusByRuntimeId,
                               [runtimeSetupStatus.runtimeId]: {
@@ -8931,7 +8950,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     session_id: sessionId,
                     message: SAVED_CHAT_RECONNECT_FAILED_MESSAGE,
                 });
-                if (isAuthenticationErrorMessage(message)) {
+                if (isAuthenticationErrorMessage(message, failedSession.runtimeId)) {
                     await get().refreshSetupStatus(
                         get().sessionsById[sessionId]?.runtimeId,
                     );
@@ -10774,7 +10793,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         message,
                     });
                 }
-                if (isAuthenticationErrorMessage(message)) {
+                if (isAuthenticationErrorMessage(message, nextRuntimeId)) {
                     await get().refreshSetupStatus(nextRuntimeId);
                 }
                 return provisionalSessionId ?? null;
