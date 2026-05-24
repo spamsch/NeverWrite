@@ -877,6 +877,7 @@ describe("chatStore", () => {
             binaryReady: true,
         });
         expect(state.selectedRuntimeId).toBe("codex-acp");
+        expect(state.defaultRuntimeId).toBeNull();
         expect(state.activeSessionId).toBe("codex-session-1");
         expect(state.getDefaultNewChatRuntimeId()).toBe("codex-acp");
         expect(
@@ -905,6 +906,7 @@ describe("chatStore", () => {
             .initialize({ createDefaultSession: false });
 
         const state = useChatStore.getState();
+        expect(state.defaultRuntimeId).toBe(CLAUDE_TERMINAL_RUNTIME_ID);
         expect(state.selectedRuntimeId).toBe(CLAUDE_TERMINAL_RUNTIME_ID);
         expect(state.getDefaultNewChatRuntimeId()).toBe(
             CLAUDE_TERMINAL_RUNTIME_ID,
@@ -924,6 +926,7 @@ describe("chatStore", () => {
         await useChatStore.getState().initialize();
 
         const state = useChatStore.getState();
+        expect(state.defaultRuntimeId).toBeNull();
         expect(state.selectedRuntimeId).toBe("codex-acp");
         expect(state.getDefaultNewChatRuntimeId()).toBe("codex-acp");
         expect(state.sessionsById["codex-session-1"]?.runtimeId).toBe(
@@ -948,8 +951,116 @@ describe("chatStore", () => {
             authReady: false,
             binaryReady: false,
         });
+        expect(state.defaultRuntimeId).toBeNull();
         expect(state.selectedRuntimeId).toBe("codex-acp");
         expect(state.getDefaultNewChatRuntimeId()).toBe("codex-acp");
+    });
+
+    it("keeps current runtime changes separate from the explicit default preference", () => {
+        useChatStore.setState({
+            runtimes: [
+                {
+                    runtime: { ...runtimePayload[0].runtime },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+                {
+                    runtime: {
+                        ...runtimePayload[0].runtime,
+                        id: "claude-acp",
+                        name: "Claude ACP",
+                    },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            setupStatusByRuntimeId: {
+                "codex-acp": readySetupStatusState,
+                "claude-acp": {
+                    ...readySetupStatusState,
+                    runtimeId: "claude-acp",
+                },
+            },
+            selectedRuntimeId: "codex-acp",
+        });
+
+        useChatStore.getState().setDefaultRuntime("codex-acp");
+        useChatStore.getState().setSelectedRuntime("claude-acp");
+
+        const state = useChatStore.getState();
+        expect(state.defaultRuntimeId).toBe("codex-acp");
+        expect(state.selectedRuntimeId).toBe("claude-acp");
+        expect(state.getDefaultNewChatRuntimeId()).toBe("codex-acp");
+        expect(
+            JSON.parse(localStorage.getItem(AI_PREFS_KEY) ?? "{}")
+                .defaultRuntimeId,
+        ).toBe("codex-acp");
+    });
+
+    it("uses the explicit default runtime when newSession is called without a runtime", async () => {
+        useChatStore.setState({
+            defaultRuntimeId: "codex-acp",
+            selectedRuntimeId: CLAUDE_TERMINAL_RUNTIME_ID,
+            runtimes: [
+                {
+                    runtime: { ...runtimePayload[0].runtime },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+                {
+                    runtime: {
+                        id: CLAUDE_TERMINAL_RUNTIME_ID,
+                        name: "Claude Code",
+                        description: "Claude Code terminal pseudo-runtime",
+                        capabilities: ["create_session"],
+                    },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            setupStatusByRuntimeId: {
+                "codex-acp": readySetupStatusState,
+                [CLAUDE_TERMINAL_RUNTIME_ID]: {
+                    ...readySetupStatusState,
+                    runtimeId: CLAUDE_TERMINAL_RUNTIME_ID,
+                    authMethod: "claude-code",
+                },
+            },
+        });
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_get_setup_status") {
+                expect(
+                    (args as { runtimeId?: string } | undefined)?.runtimeId,
+                ).toBe("codex-acp");
+                return readySetupStatus;
+            }
+            if (command === "ai_create_session") {
+                expect(
+                    (
+                        args as
+                            | { input?: { runtime_id?: string } }
+                            | undefined
+                    )?.input?.runtime_id,
+                ).toBe("codex-acp");
+                return sessionPayload;
+            }
+            return defaultInvokeImplementation(command, args);
+        });
+
+        await useChatStore.getState().newSession();
+
+        expect(invokeMock).toHaveBeenCalledWith(
+            "ai_create_session",
+            expect.objectContaining({
+                input: expect.objectContaining({
+                    runtime_id: "codex-acp",
+                }),
+            }),
+        );
     });
 
     it("selects the first configured runtime on fresh boot", async () => {
