@@ -699,6 +699,7 @@ export function TerminalViewport({
             style={{
                 backgroundColor: theme.background,
                 color: theme.text,
+                paddingBottom: 8,
             }}
             onMouseDown={handleMouseDown}
             onContextMenu={handleContextMenu}

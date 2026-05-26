@@ -6767,8 +6767,26 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         runtimes,
                         setupStatusByRuntimeId,
                     );
+
+                // Prefer the in-memory selection over the freshly-read persisted
+                // value. initialize() can be called multiple times (vault change,
+                // tab count change) and its async awaits create a window where the
+                // user may click a new default in the settings UI. In that case
+                // setDefaultRuntime() already wrote to both the store and
+                // localStorage, but this code path would otherwise overwrite the
+                // store value with the snapshot from before the click.
+                const currentStoreDefault = get().defaultRuntimeId;
+                const resolvedDefault =
+                    currentStoreDefault !== null
+                        ? (getSelectableDefaultRuntimeId(
+                              currentStoreDefault,
+                              runtimes,
+                              setupStatusByRuntimeId,
+                          ) ?? persistedRuntimeId)
+                        : persistedRuntimeId;
+
                 const initialSelectedRuntimeId =
-                    persistedRuntimeId ??
+                    resolvedDefault ??
                     getImplicitDefaultAcpRuntimeId(
                         runtimes,
                         setupStatusByRuntimeId,
@@ -6776,7 +6794,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
                 set({
                     runtimes,
-                    defaultRuntimeId: persistedRuntimeId,
+                    defaultRuntimeId: resolvedDefault,
                     selectedRuntimeId: initialSelectedRuntimeId,
                     setupStatusByRuntimeId,
                     runtimeConnectionByRuntimeId,
