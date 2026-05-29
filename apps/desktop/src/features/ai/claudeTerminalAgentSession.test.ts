@@ -1,5 +1,6 @@
+import { invoke } from "@neverwrite/runtime";
 import { waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEditorStore } from "../../app/store/editorStore";
 import { useVaultStore } from "../../app/store/vaultStore";
 import { setEditorTabs } from "../../test/test-utils";
@@ -12,7 +13,9 @@ import { EMPTY_TERMINAL_SNAPSHOT } from "../terminal/terminalTypes";
 import {
     focusClaudeTerminalAgentSession,
     pruneClaudeTerminalAgentSessions,
+    refreshClaudeTerminalAgentTranscripts,
     registerClaudeTerminalAgentSession,
+    resetClaudeTerminalAgentSessionsForTests,
 } from "./claudeTerminalAgentSession";
 import { resetChatStore, useChatStore } from "./store/chatStore";
 import { CLAUDE_TERMINAL_RUNTIME_ID } from "./utils/runtimeMetadata";
@@ -38,13 +41,16 @@ const SESSION_ID = "claude-terminal:term-1";
 
 describe("claudeTerminalAgentSession", () => {
     beforeEach(() => {
+        resetClaudeTerminalAgentSessionsForTests();
         resetChatStore();
         resetTerminalRuntimeStoreForTests();
+        vi.mocked(invoke).mockReset();
         useVaultStore.setState({ vaultPath: "/vault" });
         setEditorTabs([]);
     });
 
     afterEach(() => {
+        resetClaudeTerminalAgentSessionsForTests();
         resetChatStore();
         resetTerminalRuntimeStoreForTests();
     });
@@ -60,7 +66,11 @@ describe("claudeTerminalAgentSession", () => {
         expect(session).toBeDefined();
         expect(session?.runtimeId).toBe(CLAUDE_TERMINAL_RUNTIME_ID);
         expect(session?.terminalId).toBe("term-1");
-        expect(session?.customTitle).toBe("Claude Code 1");
+        // Default label lives in persistedTitle, so a manual rename (customTitle)
+        // and the transcript-derived title can both override it.
+        expect(session?.persistedTitle).toBe("Claude Code 1");
+        // No manual rename, so the title falls back to persistedTitle.
+        expect(session?.customTitle).toBeFalsy();
         expect(session?.messages).toEqual([]);
         expect(state.sessionOrder).toContain(SESSION_ID);
         // A terminal agent is never a real chat target, so it must not steal the
@@ -82,9 +92,68 @@ describe("claudeTerminalAgentSession", () => {
         expect(
             state.sessionOrder.filter((id) => id === SESSION_ID),
         ).toHaveLength(1);
-        expect(state.sessionsById[SESSION_ID]?.customTitle).toBe(
+        expect(state.sessionsById[SESSION_ID]?.persistedTitle).toBe(
             "Claude Code 1 (renamed)",
         );
+    });
+
+    it("fills title and preview from the Claude Code transcript", async () => {
+        vi.mocked(invoke).mockResolvedValue({
+            found: true,
+            changed: true,
+            mtimeMs: 1000,
+            title: "How do I add a route?",
+            preview: "First, open the router file and add an entry.",
+        });
+
+        registerClaudeTerminalAgentSession({
+            terminalId: "term-1",
+            title: "Claude Code 1",
+            transcriptSessionId: "uuid-1",
+            cwd: "/vault",
+        });
+
+        await refreshClaudeTerminalAgentTranscripts();
+
+        const session = useChatStore.getState().sessionsById[SESSION_ID];
+        expect(session?.persistedTitle).toBe("How do I add a route?");
+        expect(session?.persistedPreview).toBe(
+            "First, open the router file and add an entry.",
+        );
+        // It read the transcript via the backend with the pinned session id.
+        expect(vi.mocked(invoke)).toHaveBeenCalledWith(
+            "devtools_read_claude_transcript",
+            {
+                input: {
+                    sessionId: "uuid-1",
+                    cwd: "/vault",
+                    sinceMtimeMs: null,
+                },
+            },
+        );
+    });
+
+    it("leaves the default title when the transcript has not been written yet", async () => {
+        vi.mocked(invoke).mockResolvedValue({
+            found: false,
+            changed: false,
+            mtimeMs: null,
+            title: null,
+            preview: null,
+        });
+
+        registerClaudeTerminalAgentSession({
+            terminalId: "term-1",
+            title: "Claude Code 1",
+            transcriptSessionId: "uuid-1",
+            cwd: "/vault",
+        });
+
+        await refreshClaudeTerminalAgentTranscripts();
+
+        const session = useChatStore.getState().sessionsById[SESSION_ID];
+        expect(session?.persistedTitle).toBe("Claude Code 1");
+        expect(session?.persistedPreview).toBeFalsy();
     });
 
     it("focuses the terminal tab when the agent entry is opened", () => {
