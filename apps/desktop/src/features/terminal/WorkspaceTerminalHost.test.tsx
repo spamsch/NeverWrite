@@ -134,7 +134,8 @@ describe("WorkspaceTerminalHost", () => {
                     payload: TerminalOutputEventPayload;
                 }) => void,
             );
-            return vi.fn();
+            const unlisten: () => void = vi.fn();
+            return unlisten;
         });
 
         // Set up a live terminal session so output is delivered to the runtime.
@@ -232,7 +233,8 @@ describe("WorkspaceTerminalHost", () => {
                     payload: TerminalOutputEventPayload;
                 }) => void,
             );
-            return vi.fn();
+            const unlisten: () => void = vi.fn();
+            return unlisten;
         });
 
         vi.mocked(invoke).mockResolvedValue({
