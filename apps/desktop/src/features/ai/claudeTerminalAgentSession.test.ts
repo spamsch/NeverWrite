@@ -113,6 +113,18 @@ describe("claudeTerminalAgentSession", () => {
             title: "How do I add a route?",
             preview: "First, open the router file and add an entry.",
         });
+        setEditorTabs(
+            [
+                {
+                    id: "term-tab-1",
+                    kind: "terminal",
+                    terminalId: "term-1",
+                    title: "Claude Code 1",
+                    cwd: "/vault",
+                },
+            ],
+            "term-tab-1",
+        );
 
         registerClaudeTerminalAgentSession({
             terminalId: "term-1",
@@ -128,6 +140,9 @@ describe("claudeTerminalAgentSession", () => {
         expect(session?.persistedPreview).toBe(
             "First, open the router file and add an entry.",
         );
+        expect(useEditorStore.getState().tabs[0]?.title).toBe(
+            "How do I add a route?",
+        );
         // It read the transcript via the backend with the pinned session id.
         expect(vi.mocked(invoke)).toHaveBeenCalledWith(
             "devtools_read_claude_transcript",
@@ -139,6 +154,70 @@ describe("claudeTerminalAgentSession", () => {
                 },
             },
         );
+    });
+
+    it("does not replace a manually renamed terminal tab with the transcript title", async () => {
+        vi.mocked(invoke).mockResolvedValue({
+            found: true,
+            changed: true,
+            mtimeMs: 1000,
+            title: "How do I add a route?",
+            preview: "First, open the router file and add an entry.",
+        });
+        setEditorTabs(
+            [
+                {
+                    id: "term-tab-1",
+                    kind: "terminal",
+                    terminalId: "term-1",
+                    title: "Pinned Claude Scratchpad",
+                    cwd: "/vault",
+                },
+            ],
+            "term-tab-1",
+        );
+
+        registerClaudeTerminalAgentSession({
+            terminalId: "term-1",
+            title: "Claude Code 1",
+            transcriptSessionId: "uuid-1",
+            cwd: "/vault",
+        });
+
+        await refreshClaudeTerminalAgentTranscripts();
+
+        expect(useChatStore.getState().sessionsById[SESSION_ID]?.persistedTitle).toBe(
+            "How do I add a route?",
+        );
+        expect(useEditorStore.getState().tabs[0]?.title).toBe(
+            "Pinned Claude Scratchpad",
+        );
+    });
+
+    it("syncs sidebar renames to the backing terminal tab", async () => {
+        setEditorTabs(
+            [
+                {
+                    id: "term-tab-1",
+                    kind: "terminal",
+                    terminalId: "term-1",
+                    title: "Claude Code 1",
+                    cwd: "/vault",
+                },
+            ],
+            "term-tab-1",
+        );
+        registerClaudeTerminalAgentSession({
+            terminalId: "term-1",
+            title: "Claude Code 1",
+        });
+
+        useChatStore.getState().renameSession(SESSION_ID, "Renamed task");
+
+        expect(
+            useChatStore.getState().sessionsById[SESSION_ID]?.customTitle,
+        ).toBe("Renamed task");
+        expect(useEditorStore.getState().tabs[0]?.title).toBe("Renamed task");
     });
 
     it("leaves the default title when the transcript has not been written yet", async () => {

@@ -33,6 +33,7 @@ interface TerminalAgentEntry {
     // Latest transcript-derived values, re-applied if the session is rebuilt.
     title: string | null;
     preview: string | null;
+    customTitle: string | null;
     updatedAt: number;
     lastMtimeMs: number | null;
 }
@@ -67,9 +68,10 @@ function buildSession(entry: TerminalAgentEntry): AIChatSession {
         configOptions: [],
         messages: [],
         attachments: [],
-        // persistedTitle (not customTitle) so a manual rename still wins and the
-        // transcript-derived title can fill in over the default label.
+        // persistedTitle carries the transcript/default title; customTitle
+        // mirrors sidebar renames so re-asserted entries keep the user's label.
         persistedTitle: entry.title ?? entry.defaultTitle,
+        customTitle: entry.customTitle,
         persistedPreview: entry.preview,
         persistedCreatedAt: entry.createdAt,
         persistedUpdatedAt: entry.updatedAt,
@@ -113,7 +115,9 @@ function reconcileAgentSessions() {
         }
         if (!chat.sessionsById[sessionId]) {
             upsertAgentSession(entry);
+            continue;
         }
+        syncTerminalAgentCustomTitle(entry, chat.sessionsById[sessionId]);
     }
     stopTranscriptPollingIfIdle();
 }
@@ -151,8 +155,62 @@ function stopTranscriptPollingIfIdle() {
     }
 }
 
+function updateTerminalTabTitle(terminalId: string, nextTitle: string) {
+    const tab = selectEditorWorkspaceTabs(useEditorStore.getState()).find(
+        (candidate) =>
+            isTerminalTab(candidate) && candidate.terminalId === terminalId,
+    );
+    if (!tab || tab.title === nextTitle) return;
+
+    useEditorStore.getState().updateTabTitle(tab.id, nextTitle);
+}
+
+function syncTerminalTabTitleFromTranscript(
+    entry: TerminalAgentEntry,
+    nextTitle: string,
+    previousTitle: string | null,
+) {
+    const tab = selectEditorWorkspaceTabs(useEditorStore.getState()).find(
+        (candidate) =>
+            isTerminalTab(candidate) && candidate.terminalId === entry.terminalId,
+    );
+    if (!tab || tab.title === nextTitle) return;
+
+    const titleIsStillAutomatic =
+        tab.title === entry.defaultTitle ||
+        (previousTitle != null && tab.title === previousTitle);
+    if (!titleIsStillAutomatic) return;
+
+    useEditorStore.getState().updateTabTitle(tab.id, nextTitle);
+}
+
+function syncTerminalAgentCustomTitle(
+    entry: TerminalAgentEntry,
+    session: AIChatSession | undefined,
+) {
+    const nextCustomTitle = session?.customTitle?.trim() || null;
+    if (entry.customTitle === nextCustomTitle) return;
+
+    const previousCustomTitle = entry.customTitle;
+    entry.customTitle = nextCustomTitle;
+
+    const nextTabTitle = nextCustomTitle ?? entry.title ?? entry.defaultTitle;
+    if (nextCustomTitle) {
+        updateTerminalTabTitle(entry.terminalId, nextTabTitle);
+        return;
+    }
+
+    const tab = selectEditorWorkspaceTabs(useEditorStore.getState()).find(
+        (candidate) =>
+            isTerminalTab(candidate) && candidate.terminalId === entry.terminalId,
+    );
+    if (previousCustomTitle && tab?.title === previousCustomTitle) {
+        useEditorStore.getState().updateTabTitle(tab.id, nextTabTitle);
+    }
+}
+
 // Poll Claude Code's transcript for each tracked terminal and refresh the agent
-// entry's title (first prompt) and preview (latest answer).
+// entry's title (first prompt), preview (latest answer), and terminal tab title.
 export async function refreshClaudeTerminalAgentTranscripts() {
     for (const entry of [...agentsByTerminalId.values()]) {
         if (!entry.cwd || !entry.transcriptSessionId) continue;
@@ -182,7 +240,11 @@ export async function refreshClaudeTerminalAgentTranscripts() {
         if (result.mtimeMs != null) entry.lastMtimeMs = result.mtimeMs;
         if (!result.title && !result.preview) continue;
 
-        if (result.title) entry.title = result.title;
+        if (result.title) {
+            const previousTitle = entry.title;
+            entry.title = result.title;
+            syncTerminalTabTitleFromTranscript(entry, result.title, previousTitle);
+        }
         if (result.preview) entry.preview = result.preview;
         entry.updatedAt = Date.now();
 
@@ -228,6 +290,7 @@ export function registerClaudeTerminalAgentSession(args: {
         createdAt: existing?.createdAt ?? now,
         title: existing?.title ?? null,
         preview: existing?.preview ?? null,
+        customTitle: existing?.customTitle ?? null,
         updatedAt: existing?.updatedAt ?? now,
         lastMtimeMs: existing?.lastMtimeMs ?? null,
     };
