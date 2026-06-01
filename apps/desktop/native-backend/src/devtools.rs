@@ -913,6 +913,21 @@ fn system_time_to_ms(time: std::time::SystemTime) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
+fn is_valid_claude_session_id(id: &str) -> bool {
+    const UUID_LEN: usize = 36;
+    const HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
+
+    let bytes = id.as_bytes();
+    bytes.len() == UUID_LEN
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if HYPHEN_POSITIONS.contains(&index) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 /// Collapse whitespace to single spaces and cap length, so a multi-line message
 /// renders cleanly on one sidebar row.
 fn clean_one_line(text: &str, max_chars: usize) -> String {
@@ -1002,6 +1017,9 @@ fn read_claude_transcript(input: ReadClaudeTranscriptInput) -> ClaudeTranscriptR
     else {
         return ClaudeTranscriptResult::default();
     };
+    if !is_valid_claude_session_id(id) {
+        return ClaudeTranscriptResult::default();
+    }
     let path = dir.join(format!("{id}.jsonl"));
 
     let Ok(metadata) = std::fs::metadata(&path) else {
@@ -1070,6 +1088,27 @@ mod tests {
         );
         // Spaces, dots, and underscores all collapse to '-'.
         assert_eq!(encode_project_path("/a b/c.d_e"), "-a-b-c-d-e");
+    }
+
+    #[test]
+    fn validates_claude_session_id_as_uuid_basename() {
+        assert!(is_valid_claude_session_id(
+            "2198181b-9c2d-4c4b-b646-0c219657a6ff"
+        ));
+        assert!(is_valid_claude_session_id(
+            "2198181B-9C2D-4C4B-B646-0C219657A6FF"
+        ));
+
+        assert!(!is_valid_claude_session_id("../outside"));
+        assert!(!is_valid_claude_session_id(
+            "2198181b/9c2d-4c4b-b646-0c219657a6ff"
+        ));
+        assert!(!is_valid_claude_session_id(
+            "2198181b-9c2d-4c4b-b646-0c219657a6ff.jsonl"
+        ));
+        assert!(!is_valid_claude_session_id(
+            "2198181b-9c2d-4c4b-b646-0c219657a6fg"
+        ));
     }
 
     #[test]
