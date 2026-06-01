@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "child_process";
 import { ClientSideConnection, ndJsonStream, } from "@agentclientprotocol/sdk";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import { markdownEscape, toolInfoFromToolUse, toDisplayPath, toolUpdateFromToolResult, toolUpdateFromDiffToolResponse, } from "../tools.js";
-import { toAcpNotifications, promptToClaude, isLocalCommandMetadata, stripLocalCommandMetadata, ClaudeAcpAgent, claudeCliPath, describeAlwaysAllow, } from "../acp-agent.js";
+import { toAcpNotifications, promptToClaude, isLocalCommandMetadata, stripLocalCommandMetadata, ClaudeAcpAgent, claudeCliPath, describeAlwaysAllow, streamEventToAcpNotifications, } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { deleteSession, query } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -163,13 +163,15 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
             },
             name: "compact",
         });
-        // Send something
-        await connection.prompt({
-            prompt: [{ type: "text", text: "Hi" }],
-            sessionId: newSessionResponse.sessionId,
-        });
-        // Clear response
-        client.takeReceivedText();
+        // Build up enough conversation that there's something to compact. The SDK
+        // refuses to compact a conversation with too few message groups.
+        for (let i = 0; i < 6; i++) {
+            await connection.prompt({
+                prompt: [{ type: "text", text: `Reply with just the number ${i}.` }],
+                sessionId: newSessionResponse.sessionId,
+            });
+            client.takeReceivedText();
+        }
         await connection.prompt({
             prompt: [
                 {
@@ -180,7 +182,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
             sessionId: newSessionResponse.sessionId,
         });
         expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
-    }, 30000);
+    }, 60000);
 });
 describe("tool conversions", () => {
     it("should handle Bash nicely", () => {
@@ -549,6 +551,7 @@ describe("tool conversions", () => {
                     server_tool_use: null,
                     inference_geo: null,
                     iterations: null,
+                    output_tokens_details: null,
                     speed: null,
                 },
                 context_management: null,
@@ -3319,5 +3322,29 @@ describe("post-error recovery", () => {
         await expect(pendingA).resolves.toBe(true);
         await expect(pendingB).resolves.toBe(true);
         expect(session.pendingMessages.size).toBe(0);
+    });
+});
+describe("streamEventToAcpNotifications", () => {
+    it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
+        const errors = [];
+        const logger = {
+            log: () => { },
+            error: (...args) => {
+                errors.push(args);
+            },
+        };
+        const pingMessage = {
+            type: "stream_event",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            // The SDK's typed `BetaRawMessageStreamEvent` union doesn't include
+            // `ping`, but the API emits it on the wire and the SDK passes it
+            // through. Cast through `unknown` to feed the realistic runtime shape.
+            event: { type: "ping" },
+        };
+        const result = streamEventToAcpNotifications(pingMessage, "test-session", {}, { sessionUpdate: async () => { } }, logger);
+        expect(result).toEqual([]);
+        expect(errors).toEqual([]);
     });
 });

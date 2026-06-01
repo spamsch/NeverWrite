@@ -463,6 +463,13 @@ export class ClaudeAcpAgent {
         // forward it to clients as structured `data`, sparing them from
         // pattern-matching on the human-readable message text.
         let lastAssistantError;
+        // Tracks whether we're inside a compaction. The SDK emits the terminal
+        // `status` (compact_result success/failed) twice for a single failed
+        // compaction, and the two messages are indistinguishable — so we report the
+        // outcome only while a compaction is in progress, then clear this. A fresh
+        // `compacting` status sets it again, so every distinct compaction (e.g.
+        // repeated auto-compactions in a long turn) is still shown.
+        let compactionInProgress = false;
         const userMessage = promptToClaude(params);
         const promptUuid = randomUUID();
         userMessage.uuid = promptUuid;
@@ -511,11 +518,36 @@ export class ClaudeAcpAgent {
                                 break;
                             case "status": {
                                 if (message.status === "compacting") {
+                                    compactionInProgress = true;
                                     await this.client.sessionUpdate({
                                         sessionId: message.session_id,
                                         update: {
                                             sessionUpdate: "agent_message_chunk",
                                             content: { type: "text", text: "Compacting..." },
+                                        },
+                                    });
+                                }
+                                else if (message.compact_result === "success" && compactionInProgress) {
+                                    // The SDK signals manual `/compact` completion with a status
+                                    // message carrying `compact_result`, not the `compact_boundary`
+                                    // message (which only fires when there's content to compact).
+                                    compactionInProgress = false;
+                                    await this.client.sessionUpdate({
+                                        sessionId: message.session_id,
+                                        update: {
+                                            sessionUpdate: "agent_message_chunk",
+                                            content: { type: "text", text: "\n\nCompacting completed." },
+                                        },
+                                    });
+                                }
+                                else if (message.compact_result === "failed" && compactionInProgress) {
+                                    compactionInProgress = false;
+                                    const reason = message.compact_error ? `: ${message.compact_error}` : ".";
+                                    await this.client.sessionUpdate({
+                                        sessionId: message.session_id,
+                                        update: {
+                                            sessionUpdate: "agent_message_chunk",
+                                            content: { type: "text", text: `\n\nCompacting failed${reason}` },
                                         },
                                     });
                                 }
@@ -533,6 +565,10 @@ export class ClaudeAcpAgent {
                                 // The alternative (no update) leaves the client showing e.g.
                                 // "944k/1m" right after the user sees "Compacting completed",
                                 // which is confusing and wrong.
+                                //
+                                // The "Compacting completed." text is emitted from the `status`
+                                // handler (keyed on `compact_result`), not here, so the failure
+                                // path gets a message too.
                                 lastAssistantTotalUsage = 0;
                                 lastAssistantUsage = null;
                                 await this.client.sessionUpdate({
@@ -541,13 +577,6 @@ export class ClaudeAcpAgent {
                                         sessionUpdate: "usage_update",
                                         used: 0,
                                         size: session.contextWindowSize,
-                                    },
-                                });
-                                await this.client.sessionUpdate({
-                                    sessionId: message.session_id,
-                                    update: {
-                                        sessionUpdate: "agent_message_chunk",
-                                        content: { type: "text", text: "\n\nCompacting completed." },
                                     },
                                 });
                                 break;
@@ -831,7 +860,8 @@ export class ClaudeAcpAgent {
                         // /usage, /status, /model) arrive wrapped in these tags; pure-marker
                         // payloads (e.g. /compact's malformed output) strip to null and are
                         // skipped. Mirrors the replay path at replaySessionHistory.
-                        if (typeof message.message.content === "string" &&
+                        if (message.message.role !== "system" &&
+                            typeof message.message.content === "string" &&
                             message.message.content.includes("<local-command-stdout>")) {
                             const stripped = stripLocalCommandMetadata(message.message.content);
                             if (typeof stripped === "string") {
@@ -860,6 +890,9 @@ export class ClaudeAcpAgent {
                                 (Array.isArray(message.message.content) &&
                                     message.message.content.length === 1 &&
                                     message.message.content[0].type === "text"))) {
+                            break;
+                        }
+                        if (message.message.role === "system") {
                             break;
                         }
                         if (message.type === "assistant" &&
@@ -2504,6 +2537,7 @@ export function toAcpNotifications(content, role, sessionId, toolUseCache, clien
             case "compaction":
             case "compaction_delta":
             case "advisor_tool_result":
+            case "mid_conv_system":
                 break;
             default:
                 unreachable(chunk, logger);
@@ -2541,7 +2575,11 @@ export function streamEventToAcpNotifications(message, sessionId, toolUseCache, 
                 cwd: options?.cwd,
                 taskState: options?.taskState,
             });
-        // No content
+        // No content. `ping` is a Messages-API keep-alive event that the SDK's
+        // `BetaRawMessageStreamEvent` union doesn't include even though the
+        // wire format emits it; the `as never` cast lets us no-op it here
+        // instead of letting it fall through to `unreachable`.
+        case "ping":
         case "message_start":
         case "message_delta":
         case "message_stop":
