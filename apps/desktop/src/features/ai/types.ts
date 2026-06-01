@@ -643,6 +643,7 @@ export type AIComposerPart =
           filePath: string;
           mimeType: string;
           label: string;
+          createdAt?: number;
       }
     | {
           id: string;
