@@ -22,12 +22,16 @@ and terminal-auth routing helpers are in
 | `codex-acp` | `codex-acp` | Yes. Staged as a sidecar binary. | ChatGPT account, OpenAI API key, Codex API key |
 | `claude-acp` | Claude ACP adapter | Yes. Staged as vendored JS plus embedded Node. | Claude subscription terminal login, Anthropic Console terminal login, Anthropic API key, custom Anthropic-compatible gateway |
 | `gemini-acp` | `gemini --acp` | No. Must be available from PATH or a configured binary override. | Google terminal login, Gemini API key |
+| `grok-acp` | `grok --no-auto-update agent stdio` | No. Must be available from PATH or a configured binary override. | Grok terminal login, xAI API key |
 | `kilo-acp` | `kilo acp` | No. Must be available from PATH or a configured binary override. | Kilo terminal login |
 | `opencode-acp` | `opencode acp` | No. Must be available from PATH or a configured binary override. | OpenCode terminal login |
 
-Runtime descriptors returned by the backend currently use default `auto` model
-selection and `default` / `review` modes for every provider. The frontend falls
-back to the static catalog if backend inventory cannot be loaded.
+Runtime descriptors returned by the backend use default `auto` model selection.
+Providers only show modes and slash commands that are either declared by ACP or
+kept as provider-owned fallback behavior. Grok does not receive synthetic
+`default` / `review` modes or hardcoded slash commands when its ACP runtime does
+not advertise them. The frontend falls back to the static catalog if backend
+inventory cannot be loaded.
 
 ## Runtime Discovery
 
@@ -38,6 +42,7 @@ For every provider, the backend resolves the runtime command in this order:
 3. Packaged release resources, when available.
 4. Development vendor fallback for Codex and Claude.
 5. A command found on the app process `PATH`.
+6. macOS Homebrew fallback paths for Grok and OpenCode.
 
 The provider-specific runtime binary overrides are:
 
@@ -46,12 +51,14 @@ The provider-specific runtime binary overrides are:
 | `NEVERWRITE_CODEX_ACP_BIN` | Codex |
 | `NEVERWRITE_CLAUDE_ACP_BIN` | Claude |
 | `NEVERWRITE_GEMINI_ACP_BIN` | Gemini |
+| `NEVERWRITE_GROK_ACP_BIN` | Grok |
 | `NEVERWRITE_KILO_ACP_BIN` | Kilo |
 | `NEVERWRITE_OPENCODE_ACP_BIN` | OpenCode |
 
 The values may be absolute paths or command names resolvable on `PATH`. For
-Gemini, Kilo, and OpenCode, NeverWrite appends the ACP arguments automatically:
-`gemini --acp`, `kilo acp`, and `opencode acp`.
+Gemini, Grok, Kilo, and OpenCode, NeverWrite appends the ACP arguments automatically:
+`gemini --acp`, `grok --no-auto-update agent stdio`, `kilo acp`, and
+`opencode acp`.
 
 Packaged builds use `NEVERWRITE_ELECTRON_ACP_RESOURCE_DIR` internally to point
 the native backend at staged Electron resources. In normal app usage this is set
@@ -73,6 +80,7 @@ The backend also detects existing CLI auth files and environment secrets:
 | Codex | `CODEX_API_KEY`, `OPENAI_API_KEY`, or non-empty `~/.codex/auth.json` |
 | Claude | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_BEDROCK_BASE_URL`, or non-empty `~/.claude.json` |
 | Gemini | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or non-empty `~/.gemini/oauth_creds.json` |
+| Grok | `XAI_API_KEY` or active non-empty Grok CLI auth under `~/.grok/`, currently `~/.grok/auth.json` |
 | Kilo | Non-empty Kilo auth file, including `~/.local/share/kilo/auth.json` on Unix-like systems |
 | OpenCode | `OPENCODE_API_KEY`, provider keys inherited by OpenCode, or active `opencode/auth.json` in the platform data directory |
 
@@ -80,11 +88,12 @@ Codex ChatGPT auth is implemented through the ACP `authenticate` request and
 requires a resolved Codex runtime binary before NeverWrite marks it connected.
 Codex does not use the integrated auth terminal.
 
-Claude, Gemini, Kilo, and OpenCode expose integrated terminal auth methods.
+Claude, Gemini, Grok, Kilo, and OpenCode expose integrated terminal auth methods.
 NeverWrite starts the provider CLI in a PTY and marks auth pending before
 launch. A zero exit code marks the provider verified; Gemini and OpenCode can
 also be marked verified when terminal output contains success strings recognized
-by the backend.
+by the backend. Grok is marked verified when `grok login` exits successfully or
+prints recognized success output.
 
 Claude adapts its visible terminal login methods to the environment. In remote
 or no-browser environments (`NO_BROWSER`, `SSH_CONNECTION`, `SSH_CLIENT`,
@@ -146,6 +155,41 @@ auth. `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` are supported in the
 backend setup payload, but the current provider settings UI does not expose
 fields for them.
 
+### Grok
+
+Use one of:
+
+- Grok terminal login from the setup UI, exposed as `grok-login`.
+- xAI API key saved in the setup UI, exposed as `xai-api-key` and stored as `XAI_API_KEY`.
+- Existing Grok CLI auth under `~/.grok/`, currently `~/.grok/auth.json`.
+- Process environment `XAI_API_KEY`.
+
+Because Grok is not bundled by default, install the Grok CLI separately or
+configure `NEVERWRITE_GROK_ACP_BIN`. NeverWrite launches sessions as
+`grok --no-auto-update agent stdio` and opens terminal auth as `grok login`.
+
+Grok requires ACP authentication inside the same runtime process that opens the
+session. Before `session/new`, NeverWrite sends `authenticate` with
+`xai.api_key` for API-key auth and `cached_token` for Grok CLI login auth. If
+the running Grok ACP process does not advertise the selected method during
+`initialize`, setup remains local but session startup fails with an explicit
+auth-method error.
+
+Saved xAI API keys live in the OS keyring as `XAI_API_KEY`; they are not written
+to `ai/runtime-setup.json`. The JSON setup file only records the selected auth
+method and secret-key marker. If the app process inherits `XAI_API_KEY`, that
+environment value is preferred by default. A locally saved xAI key that is
+selected and ready is passed to the Grok ACP process explicitly, so it can
+recover from an inherited `XAI_API_KEY` that NeverWrite has marked invalid.
+NeverWrite does not delete or overwrite the inherited environment variable.
+
+Disconnecting Grok in NeverWrite clears local NeverWrite setup state. For stored
+xAI API keys, it also deletes the local keyring secret. For Grok CLI login, it
+records a local invalidation marker so stale `~/.grok/auth.json` credentials are
+not immediately rehydrated, but it does not remotely log out of Grok or delete
+Grok's CLI auth files. Use the Grok CLI, or remove its auth file yourself, when
+you need a full remote/provider logout.
+
 ### Kilo
 
 Use Kilo terminal login from the setup UI, a Kilo API key saved in the setup UI,
@@ -174,6 +218,7 @@ These `NEVERWRITE_*` variables are relevant to AI runtime setup and packaging:
 | `NEVERWRITE_CODEX_ACP_BIN` | Runtime launch override for Codex in dev or local troubleshooting. |
 | `NEVERWRITE_CLAUDE_ACP_BIN` | Runtime launch override for Claude in dev or local troubleshooting. |
 | `NEVERWRITE_GEMINI_ACP_BIN` | Runtime launch override for Gemini in dev or local troubleshooting. |
+| `NEVERWRITE_GROK_ACP_BIN` | Runtime launch override for Grok in dev or local troubleshooting. |
 | `NEVERWRITE_KILO_ACP_BIN` | Runtime launch override for Kilo in dev or local troubleshooting. |
 | `NEVERWRITE_OPENCODE_ACP_BIN` | Runtime launch override for OpenCode in dev or local troubleshooting. |
 | `NEVERWRITE_APP_DATA_DIR` | Overrides app data storage, including `ai/runtime-setup.json`; Electron sets this for the sidecar. |
@@ -222,10 +267,11 @@ npm run electron:sidecar:build
 npm run electron:ai-runtime:smoke
 ```
 
-The smoke test creates a fake ACP runtime, uses
+The smoke test creates fake ACP runtimes, uses
 `NEVERWRITE_AI_SECRET_STORE=memory` by default, validates runtime inventory,
 setup status, diagnostics, session creation, ACP streaming, persisted history,
-and the Codex auth-terminal rejection path.
+the Codex auth-terminal rejection path, and the Grok ACP auth handshake plus
+reversible text-diff path.
 
 ## Release Packaging
 
@@ -256,6 +302,7 @@ Current packaging expectations:
 - Codex is bundled as a native sidecar binary.
 - Claude is bundled through embedded Node plus vendored runtime files.
 - Gemini is integrated but not bundled by default.
+- Grok is integrated but not bundled by default.
 - Kilo is integrated but not bundled by default.
 - OpenCode is integrated but not bundled by default.
 
@@ -273,7 +320,7 @@ Common fixes:
 - Set the provider-specific `NEVERWRITE_*_ACP_BIN` variable before launching the app.
 - Supply a custom binary path through `ai_update_setup` if you are exercising
   the backend API directly or a caller that exposes this field.
-- For Gemini, Kilo, or OpenCode, install the CLI separately; they are not bundled in releases.
+- For Gemini, Grok, Kilo, or OpenCode, install the CLI separately; they are not bundled in releases.
 - For packaged Codex or Claude, check that `native-backend/binaries/` and
   `native-backend/embedded/` exist inside the packaged app resources.
 
@@ -290,12 +337,15 @@ reconnected or configured through environment variables.
 
 ### Provider Terminal Auth
 
-Integrated terminal auth is supported for Claude, Gemini, Kilo, and OpenCode. If terminal
-auth opens but the provider remains unready:
+Integrated terminal auth is supported for Claude, Gemini, Grok, Kilo, and
+OpenCode. If terminal auth opens but the provider remains unready:
 
 - Confirm the terminal process exited successfully.
 - For Gemini, look for provider success output such as authentication succeeded
   or successful Google sign-in.
+- For Grok, confirm `grok login` completed successfully and that active CLI auth
+  exists under `~/.grok/`, currently `~/.grok/auth.json`. You can also configure
+  `XAI_API_KEY` through the setup UI or the process environment.
 - For OpenCode, confirm `opencode auth login` completed or use `/connect` in
   OpenCode itself.
 - Reopen diagnostics and confirm the runtime launch command points to the CLI
@@ -329,8 +379,8 @@ GUI-launched apps often inherit a different PATH than interactive shells.
 Development can resolve Codex and Claude from vendor paths if those artifacts
 exist. Packaged builds should resolve Codex and Claude from
 `NEVERWRITE_ELECTRON_ACP_RESOURCE_DIR`, which Electron sets to the staged
-resources directory. Gemini, Kilo, and OpenCode still require an external CLI or
-explicit runtime override in both development and packaged builds.
+resources directory. Gemini, Grok, Kilo, and OpenCode still require an external
+CLI or explicit runtime override in both development and packaged builds.
 
 If a provider works in `npm run dev` but not in a packaged app, verify:
 
@@ -367,4 +417,4 @@ cd apps/desktop
 npm run electron:package:unsigned
 ```
 
-Last updated: June 1, 2026.
+Last updated: June 2, 2026.

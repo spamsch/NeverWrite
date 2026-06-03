@@ -333,6 +333,65 @@ describe("AIChatAgentControls", () => {
         );
     });
 
+    it("shows Grok ACP models without a model search field", () => {
+        const onConfigOptionChange = vi.fn();
+
+        renderComponent(
+            <AIChatAgentControls
+                runtimeId="grok-acp"
+                modelId="grok-build"
+                modeId=""
+                effortsByModel={{}}
+                models={[]}
+                modes={[]}
+                configOptions={[
+                    {
+                        id: "model",
+                        runtimeId: "grok-acp",
+                        category: "model",
+                        label: "Model",
+                        type: "select",
+                        value: "grok-build",
+                        options: [
+                            {
+                                value: "grok-composer-2.5-fast",
+                                label: "Composer 2.5",
+                                description: "Cursor's latest coding model",
+                            },
+                            {
+                                value: "grok-build",
+                                label: "Grok Build",
+                                description: "Best for advanced coding tasks",
+                            },
+                        ],
+                    },
+                ]}
+                onModelChange={() => {}}
+                onModeChange={() => {}}
+                onConfigOptionChange={onConfigOptionChange}
+            />,
+        );
+
+        expect(screen.queryByTitle("Approval Preset")).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByTitle("Model"));
+
+        expect(screen.queryByLabelText("Model search")).not.toBeInTheDocument();
+        expect(screen.getByText("Composer 2.5")).toBeInTheDocument();
+        expect(screen.getAllByText("Grok Build").length).toBeGreaterThan(0);
+
+        const grokBuildOption = screen
+            .getAllByRole("button", { name: "Grok Build" })
+            .at(-1);
+        expect(grokBuildOption).toBeDefined();
+        fireEvent.click(grokBuildOption!);
+
+        expect(onConfigOptionChange).toHaveBeenCalledWith(
+            "model",
+            "grok-build",
+        );
+    });
+
     it("does not show the model search field for non-searchable runtimes", () => {
         renderComponent(
             <AIChatAgentControls

@@ -44,6 +44,7 @@ import type {
 
 const OPENCODE_RUNTIME_ID = "opencode-acp";
 const OPENCODE_AUTH_METHOD_ID = "opencode-login";
+const GROK_RUNTIME_ID = "grok-acp";
 
 function getErrorMessage(error: unknown, fallback: string): string {
     if (error instanceof Error && error.message.trim()) return error.message;
@@ -57,6 +58,7 @@ function isApiKeyMethod(id?: string) {
         id === "codex-api-key" ||
         id === "anthropic-api-key" ||
         id === "use_gemini" ||
+        id === "xai-api-key" ||
         id === "kilo-api-key"
     );
 }
@@ -85,6 +87,7 @@ function getShortMethodDesc(id: string): string {
         case "claude-ai-login":
         case "console-login":
         case "claude-login":
+        case "grok-login":
         case "kilo-login":
         case OPENCODE_AUTH_METHOD_ID:
             return "Terminal sign-in";
@@ -102,6 +105,8 @@ function getShortMethodDesc(id: string): string {
             return "Google sign-in";
         case "use_gemini":
             return "Gemini API key";
+        case "xai-api-key":
+            return "xAI API key";
         case "kilo-api-key":
             return "Kilo API key";
         default:
@@ -119,6 +124,8 @@ function getAuthHelpText(id: string): string {
             return "Opens a sign-in terminal for Anthropic Console inside the app.";
         case "claude-login":
             return "Opens a sign-in terminal inside the app.";
+        case "grok-login":
+            return "Opens a Grok sign-in terminal inside the app.";
         case "kilo-login":
             return "Opens a Kilo sign-in terminal inside the app.";
         case OPENCODE_AUTH_METHOD_ID:
@@ -137,6 +144,8 @@ function getAuthHelpText(id: string): string {
             return "Opens a Gemini sign-in terminal inside the app.";
         case "use_gemini":
             return `Store a Gemini API key locally for ${APP_BRAND_NAME} only.`;
+        case "xai-api-key":
+            return `Store an xAI API key locally for ${APP_BRAND_NAME} only.`;
         case "kilo-api-key":
             return `Store a Kilo API key locally for ${APP_BRAND_NAME} only.`;
         default:
@@ -149,6 +158,7 @@ function getApiKeyPlaceholder(id?: string): string {
     if (id === "openai-api-key") return "OpenAI API key";
     if (id === "anthropic-api-key") return "Anthropic API key";
     if (id === "use_gemini") return "Gemini API key";
+    if (id === "xai-api-key") return "xAI API key";
     if (id === "kilo-api-key") return "Kilo API key";
     return "API key";
 }
@@ -161,6 +171,7 @@ function getActionLabel(
     if (methodId === "chatgpt") return "Continue with ChatGPT";
     if (isClaudeTerminalAuthMethodId(methodId)) return "Open sign-in terminal";
     if (methodId === "login_with_google") return "Open sign-in terminal";
+    if (methodId === "grok-login") return "Open sign-in terminal";
     if (methodId === "kilo-login") return "Open sign-in terminal";
     if (methodId === OPENCODE_AUTH_METHOD_ID) return "Open sign-in terminal";
     if (isApiKeyMethod(methodId)) {
@@ -217,6 +228,7 @@ interface ProviderAuthInput {
     codexApiKey: AISecretPatch;
     openaiApiKey: AISecretPatch;
     geminiApiKey: AISecretPatch;
+    xaiApiKey: AISecretPatch;
     kiloApiKey: AISecretPatch;
     anthropicBaseUrl?: string;
     anthropicBedrockBaseUrl?: string;
@@ -233,12 +245,15 @@ function setSecretPatch(value: string): AISecretPatch {
 }
 
 function supportsRuntimeBinaryOverride(runtimeId: string): boolean {
-    return runtimeId === OPENCODE_RUNTIME_ID;
+    return runtimeId === OPENCODE_RUNTIME_ID || runtimeId === GROK_RUNTIME_ID;
 }
 
 function getRuntimeBinaryPlaceholder(runtimeId: string): string {
     if (runtimeId === OPENCODE_RUNTIME_ID) {
         return "Custom OpenCode runtime path, for example opencode";
+    }
+    if (runtimeId === GROK_RUNTIME_ID) {
+        return "Custom Grok runtime path, for example grok";
     }
     return "Custom runtime path";
 }
@@ -246,6 +261,9 @@ function getRuntimeBinaryPlaceholder(runtimeId: string): string {
 function getRuntimeBinaryHelpText(runtimeId: string): string {
     if (runtimeId === OPENCODE_RUNTIME_ID) {
         return "Leave empty to use opencode from PATH.";
+    }
+    if (runtimeId === GROK_RUNTIME_ID) {
+        return "Leave empty to use grok from PATH.";
     }
     return "Leave empty to use the bundled runtime or PATH.";
 }
@@ -272,6 +290,7 @@ function hasPendingSetupUpdate(input: ProviderAuthInput): boolean {
         input.codexApiKey.action !== "unchanged" ||
         input.openaiApiKey.action !== "unchanged" ||
         input.geminiApiKey.action !== "unchanged" ||
+        input.xaiApiKey.action !== "unchanged" ||
         input.kiloApiKey.action !== "unchanged" ||
         input.anthropicApiKey.action !== "unchanged" ||
         input.anthropicBaseUrl !== undefined ||
@@ -323,6 +342,15 @@ function getProviderSearchValues(
             ? getRuntimeBinaryHelpText(provider.id)
             : undefined,
         provider.id === OPENCODE_RUNTIME_ID ? "opencode acp" : undefined,
+        provider.id === GROK_RUNTIME_ID ? "grok acp" : undefined,
+        provider.id === GROK_RUNTIME_ID ? "xAI" : undefined,
+        provider.id === GROK_RUNTIME_ID ? "XAI_API_KEY" : undefined,
+        provider.id === GROK_RUNTIME_ID
+            ? "grok --no-auto-update agent stdio"
+            : undefined,
+        provider.id === GROK_RUNTIME_ID
+            ? "NEVERWRITE_GROK_ACP_BIN"
+            : undefined,
         getMethodDisplayName(setupStatus),
         error,
         ...(setupStatus?.authMethods.flatMap((method) => [
@@ -548,6 +576,7 @@ function ProviderExpandedPanel({
     const isCodex = selectedMethodId === "codex-api-key";
     const isAnthropic = selectedMethodId === "anthropic-api-key";
     const isGemini = selectedMethodId === "use_gemini";
+    const isXai = selectedMethodId === "xai-api-key";
     const isKilo = selectedMethodId === "kilo-api-key";
     const gatewayUrlError = gatewaySelected
         ? getClaudeGatewayUrlValidationMessage(gatewayUrl)
@@ -574,6 +603,7 @@ function ProviderExpandedPanel({
             geminiApiKey: isGemini
                 ? setSecretPatch(apiKey)
                 : unchangedSecretPatch,
+            xaiApiKey: isXai ? setSecretPatch(apiKey) : unchangedSecretPatch,
             kiloApiKey: isKilo ? setSecretPatch(apiKey) : unchangedSecretPatch,
             anthropicApiKey: isAnthropic
                 ? setSecretPatch(apiKey)
@@ -1121,6 +1151,7 @@ export function AIProvidersSettings({
                         codexApiKey: input.codexApiKey,
                         openaiApiKey: input.openaiApiKey,
                         geminiApiKey: input.geminiApiKey,
+                        xaiApiKey: input.xaiApiKey,
                         kiloApiKey: input.kiloApiKey,
                         googleApiKey: unchangedSecretPatch,
                         googleCloudProject: undefined,
@@ -1223,6 +1254,7 @@ export function AIProvidersSettings({
                     codexApiKey: unchangedSecretPatch,
                     openaiApiKey: unchangedSecretPatch,
                     geminiApiKey: unchangedSecretPatch,
+                    xaiApiKey: unchangedSecretPatch,
                     googleApiKey: unchangedSecretPatch,
                     googleCloudProject: undefined,
                     googleCloudLocation: undefined,

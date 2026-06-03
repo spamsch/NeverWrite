@@ -10,9 +10,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema::{
-    AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    FileSystemCapabilities, Implementation, InitializeRequest, LoadSessionRequest, LogoutRequest,
-    Meta, NewSessionRequest, PermissionOption, PermissionOptionKind, Plan, PlanEntryPriority,
+    AuthenticateRequest, AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate,
+    CancelNotification, ClientCapabilities, ContentBlock, ContentChunk, FileSystemCapabilities,
+    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LogoutRequest, Meta,
+    NewSessionRequest, PermissionOption, PermissionOptionKind, Plan, PlanEntryPriority,
     PlanEntryStatus, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
@@ -31,13 +32,13 @@ use neverwrite_ai::{
     AiTokenUsageCostPayload, AiTokenUsagePayload, AiToolActivityActionPayload,
     AiToolActivityPayload, DiscardedAdditionalRoot, DiscardedAdditionalRootReason, ToolDiffState,
     AI_AUTH_TERMINAL_ERROR_EVENT, AI_AUTH_TERMINAL_EXITED_EVENT, AI_AUTH_TERMINAL_OUTPUT_EVENT,
-    AI_AUTH_TERMINAL_STARTED_EVENT, AI_IMAGE_GENERATION_EVENT, AI_MESSAGE_COMPLETED_EVENT,
-    AI_MESSAGE_DELTA_EVENT, AI_MESSAGE_STARTED_EVENT, AI_PERMISSION_REQUEST_EVENT,
-    AI_PLAN_UPDATED_EVENT, AI_RUNTIME_CONNECTION_EVENT, AI_SESSION_CREATED_EVENT,
-    AI_SESSION_ERROR_EVENT, AI_SESSION_UPDATED_EVENT, AI_STATUS_EVENT, AI_THINKING_COMPLETED_EVENT,
-    AI_THINKING_DELTA_EVENT, AI_THINKING_STARTED_EVENT, AI_TOKEN_USAGE_EVENT,
-    AI_TOOL_ACTIVITY_EVENT, CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID, GEMINI_RUNTIME_ID,
-    KILO_RUNTIME_ID, OPENCODE_RUNTIME_ID,
+    AI_AUTH_TERMINAL_STARTED_EVENT, AI_AVAILABLE_COMMANDS_UPDATED_EVENT, AI_IMAGE_GENERATION_EVENT,
+    AI_MESSAGE_COMPLETED_EVENT, AI_MESSAGE_DELTA_EVENT, AI_MESSAGE_STARTED_EVENT,
+    AI_PERMISSION_REQUEST_EVENT, AI_PLAN_UPDATED_EVENT, AI_RUNTIME_CONNECTION_EVENT,
+    AI_SESSION_CREATED_EVENT, AI_SESSION_ERROR_EVENT, AI_SESSION_UPDATED_EVENT, AI_STATUS_EVENT,
+    AI_THINKING_COMPLETED_EVENT, AI_THINKING_DELTA_EVENT, AI_THINKING_STARTED_EVENT,
+    AI_TOKEN_USAGE_EVENT, AI_TOOL_ACTIVITY_EVENT, CLAUDE_RUNTIME_ID, CODEX_RUNTIME_ID,
+    GEMINI_RUNTIME_ID, GROK_RUNTIME_ID, KILO_RUNTIME_ID, OPENCODE_RUNTIME_ID,
 };
 use portable_pty::{
     native_pty_system, Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize,
@@ -54,6 +55,12 @@ const ELECTRON_AI_INTERACTIVE_AUTH_UNAVAILABLE: &str =
     "Interactive AI authentication is not available in Electron yet. Use an existing CLI login, an environment/API key, or a custom gateway.";
 const ELECTRON_AI_USER_INPUT_UNAVAILABLE: &str =
     "Interactive AI user input prompts are not available in Electron yet.";
+const GROK_LOGIN_INVALIDATED_MESSAGE: &str =
+    "Grok login looks invalid or expired. Run Grok login again to reconnect.";
+const GROK_STORED_XAI_API_KEY_INVALID_MESSAGE: &str =
+    "Stored xAI API key looks invalid. Add a new xAI API key to reconnect Grok.";
+const GROK_INHERITED_XAI_API_KEY_INVALID_MESSAGE: &str =
+    "Inherited XAI_API_KEY looks invalid. Update the environment variable to reconnect Grok.";
 const AGENT_WRITE_ORIGIN_WINDOW: Duration = Duration::from_secs(15);
 const MAX_TERMINAL_SUMMARY_CHARS: usize = 8_000;
 const ACP_STATUS_EVENT_TYPE_KEY: &str = "neverwriteEventType";
@@ -107,6 +114,7 @@ struct RuntimeDefinition {
 
 const NO_ACP_ARGS: &[&str] = &[];
 const GEMINI_ACP_ARGS: &[&str] = &["--acp"];
+const GROK_ACP_ARGS: &[&str] = &["--no-auto-update", "agent", "stdio"];
 const SHELL_ACP_ARGS: &[&str] = &["acp"];
 
 const RUNTIME_DEFINITIONS: &[RuntimeDefinition] = &[
@@ -135,6 +143,15 @@ const RUNTIME_DEFINITIONS: &[RuntimeDefinition] = &[
         default_executable: "gemini",
         bin_env_var: "NEVERWRITE_GEMINI_ACP_BIN",
         acp_args: GEMINI_ACP_ARGS,
+        supports_native_resume: false,
+    },
+    RuntimeDefinition {
+        id: GROK_RUNTIME_ID,
+        name: "Grok",
+        description: "Grok ACP-compatible agent runtime.",
+        default_executable: "grok",
+        bin_env_var: "NEVERWRITE_GROK_ACP_BIN",
+        acp_args: GROK_ACP_ARGS,
         supports_native_resume: false,
     },
     RuntimeDefinition {
@@ -206,6 +223,8 @@ struct AiRuntimeSetupPayload {
     openai_api_key: Option<AiSecretPatch>,
     #[serde(default)]
     gemini_api_key: Option<AiSecretPatch>,
+    #[serde(default)]
+    xai_api_key: Option<AiSecretPatch>,
     #[serde(default)]
     kilo_api_key: Option<AiSecretPatch>,
     #[serde(default)]
@@ -685,6 +704,7 @@ fn is_secret_runtime_env_key(key: &str) -> bool {
             | "ANTHROPIC_CUSTOM_HEADERS"
             | "GEMINI_API_KEY"
             | "GOOGLE_API_KEY"
+            | "XAI_API_KEY"
             | "OPENCODE_API_KEY"
             | "KILO_API_KEY"
     )
@@ -699,6 +719,7 @@ fn secret_env_keys_for_runtime(runtime_id: &str) -> &'static [&'static str] {
             "ANTHROPIC_CUSTOM_HEADERS",
         ],
         GEMINI_RUNTIME_ID => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        GROK_RUNTIME_ID => &["XAI_API_KEY"],
         KILO_RUNTIME_ID => &["KILO_API_KEY"],
         _ => &[],
     }
@@ -782,6 +803,21 @@ struct AcpProcessSpec {
     cwd: PathBuf,
     env: HashMap<String, String>,
     runtime_id: String,
+    auth_method: Option<String>,
+    auth_handshake: Option<AcpAuthHandshake>,
+}
+
+#[derive(Debug, Clone)]
+struct AcpAuthHandshake {
+    env_method_id: &'static str,
+    external_method_id: &'static str,
+    meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone)]
+struct AcpAuthHandshakeRequest {
+    method_id: &'static str,
+    meta: Option<Meta>,
 }
 
 #[derive(Debug, Clone)]
@@ -1046,10 +1082,9 @@ impl NativeAi {
         }
         let setup = pending_setup.entry(runtime_id.clone()).or_default();
 
-        setup.custom_binary_path = input
-            .custom_binary_path
-            .clone()
-            .and_then(normalize_optional_string);
+        if let Some(custom_binary_path) = input.custom_binary_path.clone() {
+            setup.custom_binary_path = normalize_optional_string(custom_binary_path);
+        }
         update_auth_state(setup, &runtime_id, input)?;
         let status = setup_status_for(&runtime_id, setup.clone())?;
         self.setup_store.save(&pending_setup)?;
@@ -1216,7 +1251,7 @@ impl NativeAi {
                 .unwrap_or_default()
         };
         let spec = acp_process_spec(&input.runtime_id, &setup, vault_root_for_spec)?;
-        let created = start_acp_session(
+        let created = match start_acp_session(
             spec,
             AcpSessionStartMode::New {
                 additional_directories: normalized.kept.clone(),
@@ -1225,7 +1260,21 @@ impl NativeAi {
             Arc::clone(&self.inner),
             self.tool_diffs.clone(),
             self.agent_writes.clone(),
-        )?;
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                if let Err(update_error) = self.invalidate_grok_auth_after_session_start_error(
+                    &input.runtime_id,
+                    &setup,
+                    &error,
+                ) {
+                    return Err(format!(
+                        "{error}\n\nFailed to update Grok auth state: {update_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let mut session = created.session;
         let handle = created.handle;
         session.discarded_additional_roots = normalized.discarded.clone();
@@ -1311,7 +1360,7 @@ impl NativeAi {
                 .unwrap_or_default()
         };
         let spec = acp_process_spec(&input.runtime_id, &setup, vault_root_for_spec)?;
-        let created = start_acp_session(
+        let created = match start_acp_session(
             spec,
             AcpSessionStartMode::Load {
                 session_id: input.session_id,
@@ -1321,7 +1370,21 @@ impl NativeAi {
             Arc::clone(&self.inner),
             self.tool_diffs.clone(),
             self.agent_writes.clone(),
-        )?;
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                if let Err(update_error) = self.invalidate_grok_auth_after_session_start_error(
+                    &input.runtime_id,
+                    &setup,
+                    &error,
+                ) {
+                    return Err(format!(
+                        "{error}\n\nFailed to update Grok auth state: {update_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let mut session = created.session;
         let handle = created.handle;
         session.discarded_additional_roots = normalized.discarded.clone();
@@ -1393,8 +1456,11 @@ impl NativeAi {
     pub(crate) fn set_mode(&self, args: &Value) -> Result<Value, String> {
         let session_id = required_string(args, &["sessionId", "session_id"])?;
         let mode_id = required_string(args, &["modeId", "mode_id"])?;
-        if let Some(handle) = self.session_handle(&session_id)? {
-            handle.set_mode(&session_id, &mode_id)?;
+        let runtime_id = self.session_runtime_id(&session_id)?;
+        if runtime_supports_remote_mode_change(&runtime_id) {
+            if let Some(handle) = self.session_handle(&session_id)? {
+                handle.set_mode(&session_id, &mode_id)?;
+            }
         }
         self.update_session(&session_id, |session| {
             session.mode_id = mode_id;
@@ -1634,10 +1700,48 @@ impl NativeAi {
         pending.auth_method = Some(method_id.to_string());
         pending.auth_ready = false;
         pending.suppress_persisted_auth = false;
-        if runtime_id != OPENCODE_RUNTIME_ID {
+        if !is_invalidation_tracked_external_auth_runtime(runtime_id) {
             pending.auth_invalidated_at_ms = None;
         }
         pending.message = None;
+        self.setup_store.save(&pending_setup)?;
+
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|error| format!("Internal AI state error: {error}"))?;
+        state.setup = pending_setup;
+        state.setup_load_error = None;
+        Ok(())
+    }
+
+    fn invalidate_grok_auth_after_session_start_error(
+        &self,
+        runtime_id: &str,
+        setup_at_start: &RuntimeSetupState,
+        error: &str,
+    ) -> Result<(), String> {
+        if runtime_id != GROK_RUNTIME_ID || !is_grok_auth_error(error) {
+            return Ok(());
+        }
+
+        let Some(source) = grok_auth_failure_source(setup_at_start) else {
+            return Ok(());
+        };
+
+        let (mut pending_setup, setup_load_error) = {
+            let state = self
+                .inner
+                .lock()
+                .map_err(|error| format!("Internal AI state error: {error}"))?;
+            (state.setup.clone(), state.setup_load_error.clone())
+        };
+        if setup_load_error.is_some() {
+            pending_setup = self.setup_store.load().map_err(runtime_setup_load_error)?;
+        }
+
+        let setup = pending_setup.entry(runtime_id.to_string()).or_default();
+        apply_grok_auth_failure(setup, source);
         self.setup_store.save(&pending_setup)?;
 
         let mut state = self
@@ -2824,6 +2928,12 @@ impl NativeAcpClient {
                     .apply_current_mode_update(&session_id, update.current_mode_id.0.to_string());
                 self.emit_session_update_from_result(result);
             }
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.emit(
+                    AI_AVAILABLE_COMMANDS_UPDATED_EVENT,
+                    map_available_commands_update(&session_id, update),
+                );
+            }
             _ => {}
         }
         Ok(())
@@ -2912,6 +3022,90 @@ fn run_acp_auth_command(spec: AcpProcessSpec, auth_command: AcpAuthCommand) -> R
         .map_err(|_| "AI runtime authentication disconnected before responding.".to_string())?
 }
 
+async fn send_acp_authenticate_request(
+    connection: &ConnectionTo<Agent>,
+    method_id: impl Into<String>,
+    meta: Option<Meta>,
+) -> Result<(), agent_client_protocol::Error> {
+    let mut request = AuthenticateRequest::new(method_id.into());
+    if let Some(meta) = meta {
+        request = request.meta(meta);
+    }
+    connection.send_request(request).block_task().await?;
+    Ok(())
+}
+
+async fn run_acp_auth_handshake(
+    connection: &ConnectionTo<Agent>,
+    spec: &AcpProcessSpec,
+    initialize_response: &InitializeResponse,
+) -> Result<(), agent_client_protocol::Error> {
+    let Some(request) = validate_acp_auth_handshake_request(spec, initialize_response)
+        .map_err(|message| agent_client_protocol::Error::internal_error().data(message))?
+    else {
+        return Ok(());
+    };
+
+    send_acp_authenticate_request(connection, request.method_id, request.meta).await
+}
+
+fn validate_acp_auth_handshake_request(
+    spec: &AcpProcessSpec,
+    initialize_response: &InitializeResponse,
+) -> Result<Option<AcpAuthHandshakeRequest>, String> {
+    let Some(request) = acp_auth_handshake_request(spec)? else {
+        return Ok(None);
+    };
+
+    if !acp_initialize_response_has_auth_method(initialize_response, request.method_id) {
+        return Err(format!(
+            "{} ACP runtime did not advertise required auth method '{}'.",
+            runtime_name(&spec.runtime_id),
+            request.method_id
+        ));
+    }
+
+    Ok(Some(request))
+}
+
+fn acp_auth_handshake_request(
+    spec: &AcpProcessSpec,
+) -> Result<Option<AcpAuthHandshakeRequest>, String> {
+    let Some(handshake) = spec.auth_handshake.as_ref() else {
+        return Ok(None);
+    };
+    let Some(auth_method) = spec.auth_method.as_deref() else {
+        return Ok(None);
+    };
+
+    let method_id = match auth_method {
+        "xai-api-key" => handshake.env_method_id,
+        "grok-login" => handshake.external_method_id,
+        unsupported => {
+            return Err(format!(
+                "{} auth method '{}' cannot be used for the ACP auth handshake.",
+                runtime_name(&spec.runtime_id),
+                unsupported
+            ));
+        }
+    };
+
+    Ok(Some(AcpAuthHandshakeRequest {
+        method_id,
+        meta: handshake.meta.clone(),
+    }))
+}
+
+fn acp_initialize_response_has_auth_method(
+    initialize_response: &InitializeResponse,
+    method_id: &str,
+) -> bool {
+    initialize_response
+        .auth_methods
+        .iter()
+        .any(|method| method.id().0.as_ref() == method_id)
+}
+
 async fn run_acp_auth_inner(
     spec: AcpProcessSpec,
     auth_command: AcpAuthCommand,
@@ -2962,10 +3156,7 @@ async fn run_acp_auth_inner(
                         .await?;
                     match auth_command {
                         AcpAuthCommand::Authenticate(method_id) => {
-                            connection
-                                .send_request(AuthenticateRequest::new(method_id))
-                                .block_task()
-                                .await?;
+                            send_acp_authenticate_request(&connection, method_id, None).await?;
                         }
                         AcpAuthCommand::Logout => {
                             connection
@@ -3103,7 +3294,7 @@ async fn run_acp_actor_inner(
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
             let response = tokio::select! {
                 response = async {
-                    connection
+                    let initialize_response = connection
                         .send_request(
                             InitializeRequest::new(ProtocolVersion::LATEST)
                                 .client_capabilities(
@@ -3116,6 +3307,7 @@ async fn run_acp_actor_inner(
                         )
                         .block_task()
                         .await?;
+                    run_acp_auth_handshake(&connection, &spec, &initialize_response).await?;
                     emit_event(
                         &event_tx_for_connection,
                         AI_RUNTIME_CONNECTION_EVENT,
@@ -3410,10 +3602,19 @@ fn session_from_acp_response(
     let modes = modes_state
         .as_ref()
         .map(|state| map_session_modes(runtime_id, state))
-        .unwrap_or_else(|| default_modes(runtime_id));
-    let mut config_options = config_options
-        .map(|options| map_session_config_options(runtime_id, options))
-        .unwrap_or_else(|| default_config_options(runtime_id, &models, &modes));
+        .unwrap_or_else(|| default_modes_for_acp_session(runtime_id));
+    let mut config_options = match config_options {
+        Some(options) => map_session_config_options(runtime_id, options),
+        None => {
+            let mut options = default_config_options(runtime_id, &models, &modes);
+            align_synthesized_config_options_to_acp_state(
+                &mut options,
+                models_state.as_ref(),
+                modes_state.as_ref(),
+            );
+            options
+        }
+    };
     config_options = ensure_reasoning_config_option(
         runtime_id,
         config_options,
@@ -3425,7 +3626,8 @@ fn session_from_acp_response(
         .unwrap_or_default();
     let mode_id = selected_mode_id(modes_state.as_ref(), &config_options)
         .or_else(|| modes.first().map(|mode| mode.id.clone()))
-        .unwrap_or_else(|| "default".to_string());
+        .or_else(|| default_mode_id_for_runtime(runtime_id))
+        .unwrap_or_default();
 
     AiSession {
         session_id,
@@ -3543,6 +3745,36 @@ fn map_session_config_options(
             })
         })
         .collect()
+}
+
+fn align_synthesized_config_options_to_acp_state(
+    config_options: &mut [AiConfigOption],
+    models_state: Option<&SessionModelState>,
+    modes_state: Option<&SessionModeState>,
+) {
+    if let Some(model_id) = models_state
+        .map(|state| strip_effort_suffix(state.current_model_id.0.as_ref()).to_string())
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some(option) = config_options
+            .iter_mut()
+            .find(|option| matches!(option.category, AiConfigOptionCategory::Model))
+        {
+            option.value = model_id;
+        }
+    }
+
+    if let Some(mode_id) = modes_state
+        .map(|state| state.current_mode_id.0.to_string())
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some(option) = config_options
+            .iter_mut()
+            .find(|option| matches!(option.category, AiConfigOptionCategory::Mode))
+        {
+            option.value = mode_id;
+        }
+    }
 }
 
 fn map_config_option_category(
@@ -3721,6 +3953,20 @@ fn acp_config_option_remote_command(
     config_options: &[AiConfigOption],
     option_id: &str,
 ) -> AcpConfigOptionRemoteCommand {
+    if runtime_id == GROK_RUNTIME_ID {
+        let category = config_options
+            .iter()
+            .find(|option| option.id == option_id)
+            .map(|option| &option.category);
+        return match category {
+            Some(AiConfigOptionCategory::Model) => AcpConfigOptionRemoteCommand::SetModel,
+            Some(AiConfigOptionCategory::Mode) => AcpConfigOptionRemoteCommand::LocalOnly,
+            Some(_) => AcpConfigOptionRemoteCommand::LocalOnly,
+            None if option_id == "model" => AcpConfigOptionRemoteCommand::SetModel,
+            None => AcpConfigOptionRemoteCommand::LocalOnly,
+        };
+    }
+
     if runtime_id != GEMINI_RUNTIME_ID {
         return AcpConfigOptionRemoteCommand::SetConfigOption;
     }
@@ -3795,6 +4041,36 @@ fn map_plan_update(session_id: &str, plan: Plan, meta: Option<&Meta>) -> AiPlanU
                 status: plan_entry_status_label(&entry.status).to_string(),
             })
             .collect(),
+    }
+}
+
+fn map_available_commands_update(
+    session_id: &str,
+    update: AvailableCommandsUpdate,
+) -> neverwrite_ai::AiAvailableCommandsPayload {
+    neverwrite_ai::AiAvailableCommandsPayload {
+        session_id: session_id.to_string(),
+        commands: update
+            .available_commands
+            .into_iter()
+            .map(map_available_command)
+            .collect(),
+    }
+}
+
+fn map_available_command(command: AvailableCommand) -> neverwrite_ai::AiAvailableCommandPayload {
+    let name = command.name.trim_start_matches('/').to_string();
+    let label = format!("/{name}");
+    let has_input = matches!(command.input, Some(AvailableCommandInput::Unstructured(_)));
+    neverwrite_ai::AiAvailableCommandPayload {
+        id: name.clone(),
+        label: label.clone(),
+        description: command.description,
+        insert_text: if has_input {
+            format!("{label} ")
+        } else {
+            label
+        },
     }
 }
 
@@ -4206,7 +4482,7 @@ fn runtime_descriptors() -> Vec<AiRuntimeDescriptor> {
         .map(|definition| {
             let runtime_id = definition.id;
             let models = default_models(runtime_id);
-            let modes = default_modes(runtime_id);
+            let modes = default_modes_for_runtime_descriptor(runtime_id);
             let mut capabilities = vec![
                 "create_session".to_string(),
                 "prompt_queueing".to_string(),
@@ -4235,6 +4511,10 @@ fn runtime_supports_native_resume(runtime_id: &str) -> bool {
     runtime_definition(runtime_id)
         .map(|definition| definition.supports_native_resume)
         .unwrap_or(false)
+}
+
+fn runtime_supports_remote_mode_change(runtime_id: &str) -> bool {
+    runtime_id != GROK_RUNTIME_ID
 }
 
 trait RuntimeDescriptorAuthTags {
@@ -4278,13 +4558,35 @@ fn default_modes(runtime_id: &str) -> Vec<AiModeOption> {
     ]
 }
 
+fn default_modes_for_acp_session(runtime_id: &str) -> Vec<AiModeOption> {
+    if runtime_id == GROK_RUNTIME_ID {
+        Vec::new()
+    } else {
+        default_modes(runtime_id)
+    }
+}
+
+fn default_modes_for_runtime_descriptor(runtime_id: &str) -> Vec<AiModeOption> {
+    if runtime_id == GROK_RUNTIME_ID {
+        Vec::new()
+    } else {
+        default_modes(runtime_id)
+    }
+}
+
+fn default_mode_id_for_runtime(runtime_id: &str) -> Option<String> {
+    (runtime_id != GROK_RUNTIME_ID).then(|| "default".to_string())
+}
+
 fn default_config_options(
     runtime_id: &str,
     models: &[AiModelOption],
     modes: &[AiModeOption],
 ) -> Vec<AiConfigOption> {
-    vec![
-        AiConfigOption {
+    let mut options = Vec::new();
+
+    if !models.is_empty() {
+        options.push(AiConfigOption {
             id: "model".to_string(),
             runtime_id: runtime_id.to_string(),
             category: AiConfigOptionCategory::Model,
@@ -4303,8 +4605,11 @@ fn default_config_options(
                     description: Some(model.description.clone()),
                 })
                 .collect(),
-        },
-        AiConfigOption {
+        });
+    }
+
+    if !modes.is_empty() {
+        options.push(AiConfigOption {
             id: "mode".to_string(),
             runtime_id: runtime_id.to_string(),
             category: AiConfigOptionCategory::Mode,
@@ -4323,8 +4628,10 @@ fn default_config_options(
                     description: Some(mode.description.clone()),
                 })
                 .collect(),
-        },
-    ]
+        });
+    }
+
+    options
 }
 
 fn new_session(runtime_id: &str) -> Result<AiSession, String> {
@@ -4339,7 +4646,7 @@ fn new_session(runtime_id: &str) -> Result<AiSession, String> {
 fn new_session_with_id(runtime_id: &str, session_id: String) -> Result<AiSession, String> {
     validate_runtime_id(runtime_id)?;
     let models = default_models(runtime_id);
-    let modes = default_modes(runtime_id);
+    let modes = default_modes_for_acp_session(runtime_id);
     let config_options = default_config_options(runtime_id, &models, &modes);
     Ok(AiSession {
         session_id,
@@ -4355,7 +4662,8 @@ fn new_session_with_id(runtime_id: &str, session_id: String) -> Result<AiSession
         mode_id: modes
             .first()
             .map(|mode| mode.id.clone())
-            .unwrap_or_else(|| "default".to_string()),
+            .or_else(|| default_mode_id_for_runtime(runtime_id))
+            .unwrap_or_default(),
         status: AiSessionStatus::Idle,
         efforts_by_model: HashMap::new(),
         models,
@@ -4394,7 +4702,7 @@ fn setup_status_for_with_inherited_auth(
     };
     let inherited_auth_method = inherited_auth_method
         .filter(|method| inherited_auth_method_applies_to_setup(&setup, method));
-    let auth_ready = setup.auth_ready || inherited_auth_method.is_some();
+    let auth_ready = binary_ready && (setup.auth_ready || inherited_auth_method.is_some());
     let auth_method = setup.auth_method.or(inherited_auth_method);
     let message = if !binary_ready {
         setup.message
@@ -4427,6 +4735,10 @@ fn inherited_auth_method_applies_to_setup(
     setup: &RuntimeSetupState,
     inherited_method: &str,
 ) -> bool {
+    if inherited_method == "xai-api-key" && grok_inherited_xai_api_key_marked_invalid(setup) {
+        return false;
+    }
+
     match setup.auth_method.as_deref() {
         Some(selected_method)
             if is_local_auth_method(selected_method)
@@ -4505,6 +4817,16 @@ fn acp_process_spec(
         )
     })?;
     let mut env = setup.env.clone();
+    for key in secret_env_keys_for_runtime(runtime_id) {
+        let inherited_secret_should_win = env_secret_present(key)
+            && !setup_secret_env_overrides_inherited(runtime_id, setup, key);
+        if inherited_secret_should_win {
+            env.remove(*key);
+        }
+    }
+    if runtime_id == GROK_RUNTIME_ID && grok_inherited_xai_api_key_marked_invalid(setup) {
+        env.insert("XAI_API_KEY".to_string(), String::new());
+    }
     if let Some(method) = setup.auth_method.as_deref() {
         if runtime_id == GEMINI_RUNTIME_ID {
             env.insert(
@@ -4527,13 +4849,61 @@ fn acp_process_spec(
         env.entry("AWS_BEARER_TOKEN_BEDROCK".to_string())
             .or_default();
     }
+    let auth_method = effective_auth_method_for_acp_process_spec(runtime_id, setup);
     Ok(AcpProcessSpec {
         program,
         args: resolved.args,
         cwd,
         env,
         runtime_id: runtime_id.to_string(),
+        auth_method,
+        auth_handshake: acp_auth_handshake_for_runtime(runtime_id),
     })
+}
+
+fn setup_secret_env_overrides_inherited(
+    runtime_id: &str,
+    setup: &RuntimeSetupState,
+    env_key: &str,
+) -> bool {
+    runtime_id == GROK_RUNTIME_ID
+        && env_key == "XAI_API_KEY"
+        && setup.auth_method.as_deref() == Some("xai-api-key")
+        && setup.auth_ready
+        && auth_method_has_local_config(setup, "xai-api-key")
+}
+
+fn effective_auth_method_for_acp_process_spec(
+    runtime_id: &str,
+    setup: &RuntimeSetupState,
+) -> Option<String> {
+    if runtime_id == GROK_RUNTIME_ID && grok_inherited_xai_api_key_marked_invalid(setup) {
+        return None;
+    }
+
+    let inherited_auth_method = inherited_auth_method_for_setup(runtime_id, setup)
+        .filter(|method| inherited_auth_method_applies_to_setup(setup, method));
+    if let Some(selected_method) = setup.auth_method.as_deref() {
+        if is_persistable_external_auth_method(runtime_id, selected_method) && !setup.auth_ready {
+            return inherited_auth_method.or_else(|| setup.auth_method.clone());
+        }
+    }
+    setup.auth_method.clone().or(inherited_auth_method)
+}
+
+fn acp_auth_handshake_for_runtime(runtime_id: &str) -> Option<AcpAuthHandshake> {
+    if runtime_id == GROK_RUNTIME_ID {
+        return Some(AcpAuthHandshake {
+            env_method_id: "xai.api_key",
+            external_method_id: "cached_token",
+            meta: Some(grok_acp_auth_meta()),
+        });
+    }
+    None
+}
+
+fn grok_acp_auth_meta() -> Meta {
+    Meta::from_iter([("headless".to_string(), json!(true))])
 }
 
 #[derive(Debug)]
@@ -4685,7 +5055,7 @@ fn runtime_binary_name(base: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn resolve_macos_homebrew_runtime_fallback(runtime_id: &str) -> Option<PathBuf> {
-    if runtime_id != OPENCODE_RUNTIME_ID {
+    if !matches!(runtime_id, GROK_RUNTIME_ID | OPENCODE_RUNTIME_ID) {
         return None;
     }
     ["/opt/homebrew/bin", "/usr/local/bin"]
@@ -4703,6 +5073,7 @@ fn default_terminal_auth_method(runtime_id: &str) -> &'static str {
     match runtime_id {
         CLAUDE_RUNTIME_ID => default_claude_terminal_auth_method(),
         GEMINI_RUNTIME_ID => "login_with_google",
+        GROK_RUNTIME_ID => "grok-login",
         KILO_RUNTIME_ID => "kilo-login",
         OPENCODE_RUNTIME_ID => "opencode-login",
         _ => "terminal-login",
@@ -4762,6 +5133,10 @@ fn auth_terminal_launch_config(
                 gemini_cli_auth_type(method_id).to_string(),
             );
             "Gemini Login".to_string()
+        }
+        (GROK_RUNTIME_ID, "grok-login") => {
+            args.push("login".to_string());
+            "Grok Login".to_string()
         }
         (KILO_RUNTIME_ID, "kilo-login") => {
             args.extend(["auth".to_string(), "login".to_string()]);
@@ -4985,6 +5360,15 @@ fn inherited_auth_method(
                     auth_invalidated_at_ms,
                 )
             }),
+        GROK_RUNTIME_ID => env_secret_present("XAI_API_KEY")
+            .then(|| "xai-api-key".to_string())
+            .or_else(|| {
+                inherited_persisted_auth_method(
+                    runtime_id,
+                    include_persisted,
+                    auth_invalidated_at_ms,
+                )
+            }),
         KILO_RUNTIME_ID => env_secret_present("KILO_API_KEY")
             .then(|| "kilo-api-key".to_string())
             .or_else(|| {
@@ -5062,6 +5446,9 @@ fn persisted_cli_auth_method_for_home_with_invalidated_at(
         KILO_RUNTIME_ID if non_empty_file_exists_any(kilo_auth_file_candidates(home)) => {
             Some("kilo-login".to_string())
         }
+        GROK_RUNTIME_ID if active_grok_auth_file_exists(home, auth_invalidated_at_ms) => {
+            Some("grok-login".to_string())
+        }
         OPENCODE_RUNTIME_ID if active_opencode_auth_file_exists(home, auth_invalidated_at_ms) => {
             Some("opencode-login".to_string())
         }
@@ -5116,6 +5503,14 @@ fn opencode_env_auth_present() -> bool {
         .any(|key| env_secret_present(key))
 }
 
+fn grok_auth_file_path(home: &Path) -> PathBuf {
+    home.join(".grok").join("auth.json")
+}
+
+fn active_grok_auth_file_exists(home: &Path, auth_invalidated_at_ms: Option<u64>) -> bool {
+    timestamped_non_empty_file_is_active(&grok_auth_file_path(home), auth_invalidated_at_ms)
+}
+
 fn opencode_auth_file_candidates(home: &Path) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(xdg_data_home) = std::env::var_os("XDG_DATA_HOME") {
@@ -5152,6 +5547,22 @@ fn active_opencode_auth_file_exists(home: &Path, auth_invalidated_at_ms: Option<
         .any(|path| opencode_auth_file_is_active(&path, auth_invalidated_at_ms))
 }
 
+fn timestamped_non_empty_file_is_active(path: &Path, auth_invalidated_at_ms: Option<u64>) -> bool {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => metadata,
+        _ => return false,
+    };
+    if let Some(invalidated_at_ms) = auth_invalidated_at_ms {
+        let Some(modified_at_ms) = metadata.modified().ok().and_then(system_time_epoch_ms) else {
+            return false;
+        };
+        if modified_at_ms <= invalidated_at_ms {
+            return false;
+        }
+    }
+    true
+}
+
 fn opencode_auth_file_status(path: &Path) -> &'static str {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => metadata,
@@ -5172,17 +5583,8 @@ fn opencode_auth_file_status(path: &Path) -> &'static str {
 }
 
 fn opencode_auth_file_is_active(path: &Path, auth_invalidated_at_ms: Option<u64>) -> bool {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() > 0 => metadata,
-        _ => return false,
-    };
-    if let Some(invalidated_at_ms) = auth_invalidated_at_ms {
-        let Some(modified_at_ms) = metadata.modified().ok().and_then(system_time_epoch_ms) else {
-            return false;
-        };
-        if modified_at_ms <= invalidated_at_ms {
-            return false;
-        }
+    if !timestamped_non_empty_file_is_active(path, auth_invalidated_at_ms) {
+        return false;
     }
 
     match std::fs::read_to_string(path)
@@ -5234,6 +5636,10 @@ fn auth_method_has_local_config(setup: &RuntimeSetupState, method_id: &str) -> b
             .env
             .get("KILO_API_KEY")
             .is_some_and(|value| !value.is_empty()),
+        "xai-api-key" => setup
+            .env
+            .get("XAI_API_KEY")
+            .is_some_and(|value| !value.is_empty()),
         "gateway" => {
             setup.has_gateway_config
                 && !setup
@@ -5261,8 +5667,12 @@ fn should_persist_auth_method(
 fn is_persistable_external_auth_method(runtime_id: &str, method_id: &str) -> bool {
     matches!(
         (runtime_id, method_id),
-        (OPENCODE_RUNTIME_ID, "opencode-login")
+        (GROK_RUNTIME_ID, "grok-login") | (OPENCODE_RUNTIME_ID, "opencode-login")
     )
+}
+
+fn is_invalidation_tracked_external_auth_runtime(runtime_id: &str) -> bool {
+    matches!(runtime_id, GROK_RUNTIME_ID | OPENCODE_RUNTIME_ID)
 }
 
 fn is_local_auth_method(method_id: &str) -> bool {
@@ -5273,6 +5683,7 @@ fn is_local_auth_method(method_id: &str) -> bool {
             | "anthropic-api-key"
             | "use_gemini"
             | "kilo-api-key"
+            | "xai-api-key"
             | "gateway"
             | "gateway-bedrock"
     )
@@ -5321,6 +5732,11 @@ fn local_auth_method_for_runtime(runtime_id: &str, setup: &RuntimeSetupState) ->
             .get("KILO_API_KEY")
             .is_some_and(|value| !value.is_empty())
             .then(|| "kilo-api-key".to_string()),
+        GROK_RUNTIME_ID => setup
+            .env
+            .get("XAI_API_KEY")
+            .is_some_and(|value| !value.is_empty())
+            .then(|| "xai-api-key".to_string()),
         _ => None,
     }
 }
@@ -5348,7 +5764,8 @@ fn clear_runtime_auth_state(runtime_id: &str, setup: &mut RuntimeSetupState) {
     setup.auth_ready = false;
     setup.auth_method = None;
     setup.suppress_persisted_auth = true;
-    setup.auth_invalidated_at_ms = (runtime_id == OPENCODE_RUNTIME_ID).then(current_epoch_ms);
+    setup.auth_invalidated_at_ms =
+        is_invalidation_tracked_external_auth_runtime(runtime_id).then(current_epoch_ms);
     setup.has_gateway_config = false;
     setup.has_gateway_url = false;
     setup.message = None;
@@ -5364,6 +5781,7 @@ fn clear_runtime_auth_state(runtime_id: &str, setup: &mut RuntimeSetupState) {
         "AWS_BEARER_TOKEN_BEDROCK",
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
+        "XAI_API_KEY",
         "OPENCODE_API_KEY",
         "KILO_API_KEY",
         "GOOGLE_CLOUD_PROJECT",
@@ -5371,6 +5789,82 @@ fn clear_runtime_auth_state(runtime_id: &str, setup: &mut RuntimeSetupState) {
     ] {
         setup.env.remove(key);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokAuthFailureSource {
+    Login,
+    StoredXaiApiKey,
+    InheritedXaiApiKey,
+}
+
+fn is_grok_auth_error(error: &str) -> bool {
+    let normalized = error.to_lowercase();
+    [
+        "run grok login",
+        "set xai_api_key",
+        "authentication required",
+        "auth_required",
+        "unauthorized",
+        "401",
+        "invalid api key",
+        "cached_token",
+    ]
+    .into_iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn grok_auth_failure_source(setup: &RuntimeSetupState) -> Option<GrokAuthFailureSource> {
+    match effective_auth_method_for_acp_process_spec(GROK_RUNTIME_ID, setup).as_deref() {
+        Some("grok-login") => Some(GrokAuthFailureSource::Login),
+        Some("xai-api-key") if env_secret_present("XAI_API_KEY") => {
+            Some(GrokAuthFailureSource::InheritedXaiApiKey)
+        }
+        Some("xai-api-key") => Some(GrokAuthFailureSource::StoredXaiApiKey),
+        _ if env_secret_present("XAI_API_KEY") => Some(GrokAuthFailureSource::InheritedXaiApiKey),
+        _ if setup
+            .env
+            .get("XAI_API_KEY")
+            .is_some_and(|value| !value.trim().is_empty()) =>
+        {
+            Some(GrokAuthFailureSource::StoredXaiApiKey)
+        }
+        _ => None,
+    }
+}
+
+fn apply_grok_auth_failure(setup: &mut RuntimeSetupState, source: GrokAuthFailureSource) {
+    match source {
+        GrokAuthFailureSource::Login => {
+            setup.auth_method = Some("grok-login".to_string());
+            setup.auth_ready = false;
+            setup.suppress_persisted_auth = false;
+            setup.auth_invalidated_at_ms = Some(current_epoch_ms());
+            setup.message = Some(GROK_LOGIN_INVALIDATED_MESSAGE.to_string());
+        }
+        GrokAuthFailureSource::StoredXaiApiKey => {
+            setup.env.remove("XAI_API_KEY");
+            setup.auth_method = None;
+            setup.auth_ready = false;
+            setup.suppress_persisted_auth = true;
+            setup.auth_invalidated_at_ms = None;
+            setup.message = Some(GROK_STORED_XAI_API_KEY_INVALID_MESSAGE.to_string());
+        }
+        GrokAuthFailureSource::InheritedXaiApiKey => {
+            setup.auth_method = Some("xai-api-key".to_string());
+            setup.auth_ready = false;
+            setup.suppress_persisted_auth = false;
+            setup.auth_invalidated_at_ms = None;
+            setup.message = Some(GROK_INHERITED_XAI_API_KEY_INVALID_MESSAGE.to_string());
+        }
+    }
+    refresh_runtime_setup_flags(GROK_RUNTIME_ID, setup);
+}
+
+fn grok_inherited_xai_api_key_marked_invalid(setup: &RuntimeSetupState) -> bool {
+    setup.auth_method.as_deref() == Some("xai-api-key")
+        && !setup.auth_ready
+        && setup.message.as_deref() == Some(GROK_INHERITED_XAI_API_KEY_INVALID_MESSAGE)
 }
 
 fn env_secret_present(key: &str) -> bool {
@@ -5444,6 +5938,19 @@ fn auth_methods(runtime_id: &str) -> Vec<AiAuthMethod> {
                 description: "Use a Gemini Developer API key stored locally.".to_string(),
             },
         ],
+        GROK_RUNTIME_ID => vec![
+            AiAuthMethod {
+                id: "grok-login".to_string(),
+                name: "Grok login".to_string(),
+                description: "Open the Grok CLI sign-in flow in an integrated terminal."
+                    .to_string(),
+            },
+            AiAuthMethod {
+                id: "xai-api-key".to_string(),
+                name: "xAI API key".to_string(),
+                description: "Use an xAI API key stored locally.".to_string(),
+            },
+        ],
         KILO_RUNTIME_ID => vec![
             AiAuthMethod {
                 id: "kilo-login".to_string(),
@@ -5472,6 +5979,7 @@ fn auth_method_ids(runtime_id: &str) -> Vec<&'static str> {
         CODEX_RUNTIME_ID => vec!["chatgpt", "openai-api-key", "codex-api-key"],
         CLAUDE_RUNTIME_ID => claude_auth_method_ids_for_environment(is_claude_remote_environment()),
         GEMINI_RUNTIME_ID => vec!["login_with_google", "use_gemini"],
+        GROK_RUNTIME_ID => vec!["grok-login", "xai-api-key"],
         KILO_RUNTIME_ID => vec!["kilo-login", "kilo-api-key"],
         OPENCODE_RUNTIME_ID => vec!["opencode-login"],
         _ => vec![],
@@ -5713,6 +6221,11 @@ fn update_auth_state(
         }
         if let Some(patch) = input.google_api_key.clone() {
             touched_auth |= apply_secret_patch(setup, "GOOGLE_API_KEY", patch, "use_gemini");
+        }
+    }
+    if runtime_id == GROK_RUNTIME_ID {
+        if let Some(patch) = input.xai_api_key.clone() {
+            touched_auth |= apply_secret_patch(setup, "XAI_API_KEY", patch, "xai-api-key");
         }
     }
     if runtime_id == KILO_RUNTIME_ID {
@@ -6268,6 +6781,15 @@ fn auth_terminal_output_indicates_success(runtime_id: &str, buffer: &str) -> boo
                 || lower.contains("successfully authenticated")
                 || lower.contains("successfully logged in")
         }
+        GROK_RUNTIME_ID => {
+            let lower = buffer.to_ascii_lowercase();
+            lower.contains("authentication successful")
+                || lower.contains("login successful")
+                || lower.contains("logged in successfully")
+                || lower.contains("successfully authenticated")
+                || lower.contains("successfully logged in")
+                || lower.contains("successfully signed in")
+        }
         _ => false,
     }
 }
@@ -6505,14 +7027,18 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{
-        ConfigOptionUpdate, Meta, ModelInfo, PermissionOptionKind, PlanEntry, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigSelectOption, SessionInfoUpdate,
-        SessionModelState, SessionNotification, SessionUpdate, ToolCallContent, ToolCallId,
-        ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        AvailableCommandInput, AvailableCommandsUpdate, ConfigOptionUpdate, Meta, ModelInfo,
+        PermissionOptionKind, PlanEntry, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelectOption, SessionInfoUpdate, SessionModelState, SessionNotification,
+        SessionUpdate, ToolCallContent, ToolCallId, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
+        UnstructuredCommandInput,
     };
     use std::fs;
     use std::sync::mpsc;
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
+
+    static ENV_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn test_client(event_tx: mpsc::Sender<RpcOutput>) -> NativeAcpClient {
         test_client_with_state(event_tx, Arc::new(Mutex::new(NativeAiInner::default())))
@@ -7040,8 +7566,178 @@ mod tests {
         assert!(runtime_supports_native_resume(CODEX_RUNTIME_ID));
         assert!(!runtime_supports_native_resume(CLAUDE_RUNTIME_ID));
         assert!(!runtime_supports_native_resume(GEMINI_RUNTIME_ID));
+        assert!(!runtime_supports_native_resume(GROK_RUNTIME_ID));
         assert!(!runtime_supports_native_resume(KILO_RUNTIME_ID));
         assert!(!runtime_supports_native_resume(OPENCODE_RUNTIME_ID));
+    }
+
+    #[test]
+    fn grok_runtime_is_registered_with_expected_launch_contract() {
+        let definition = runtime_definition(GROK_RUNTIME_ID).unwrap();
+        assert_eq!(definition.name, "Grok");
+        assert_eq!(definition.default_executable, "grok");
+        assert_eq!(definition.bin_env_var, "NEVERWRITE_GROK_ACP_BIN");
+        assert_eq!(definition.acp_args, ["--no-auto-update", "agent", "stdio"]);
+
+        let descriptors = runtime_descriptors();
+        let descriptor = descriptors
+            .iter()
+            .find(|descriptor| descriptor.runtime.id == GROK_RUNTIME_ID)
+            .unwrap();
+        assert_eq!(descriptor.runtime.name, "Grok");
+        assert!(descriptor
+            .runtime
+            .capabilities
+            .iter()
+            .all(|capability| capability != "resume_session"));
+        assert!(descriptor
+            .runtime
+            .capabilities
+            .iter()
+            .any(|capability| capability == "xai-api-key"));
+        assert!(descriptor
+            .runtime
+            .capabilities
+            .iter()
+            .any(|capability| capability == "grok-login"));
+        assert!(diagnostic_executable_names().contains(&"grok"));
+    }
+
+    #[test]
+    fn grok_setup_status_reports_missing_binary_without_auth_ready() {
+        let status = setup_status_for(
+            GROK_RUNTIME_ID,
+            RuntimeSetupState {
+                custom_binary_path: Some("/neverwrite/missing/grok".to_string()),
+                ..RuntimeSetupState::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(status.runtime_id, GROK_RUNTIME_ID);
+        assert!(!status.binary_ready);
+        assert_eq!(status.binary_source, AiRuntimeBinarySource::Missing);
+        assert!(!status.auth_ready);
+        assert!(status.onboarding_required);
+    }
+
+    #[test]
+    fn setup_status_accepts_grok_xai_api_key() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut env = HashMap::new();
+        env.insert("XAI_API_KEY".to_string(), "xai-test-secret".to_string());
+        let status = setup_status_for(
+            GROK_RUNTIME_ID,
+            RuntimeSetupState {
+                custom_binary_path: Some(current_exe.display().to_string()),
+                auth_method: Some("xai-api-key".to_string()),
+                auth_ready: true,
+                env,
+                ..RuntimeSetupState::default()
+            },
+        )
+        .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(status.runtime_id, GROK_RUNTIME_ID);
+        assert!(status.binary_ready);
+        assert!(status.auth_ready);
+        assert!(!status.onboarding_required);
+        assert_eq!(status.auth_method.as_deref(), Some("xai-api-key"));
+    }
+
+    #[test]
+    fn grok_xai_key_update_preserves_custom_binary_path() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let native_ai = test_native_ai_with_secret_store(
+            store_path,
+            Arc::new(InMemoryRuntimeSecretStore::default()),
+        );
+        let current_exe = std::env::current_exe().unwrap();
+        let current_exe_display = current_exe.display().to_string();
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": current_exe,
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-first-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": null,
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-second-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        let setup = native_ai.inner.lock().unwrap();
+        let grok_setup = setup
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .expect("Grok setup should remain configured");
+        assert_eq!(
+            grok_setup.custom_binary_path.as_deref(),
+            Some(current_exe_display.as_str())
+        );
+        assert_eq!(grok_setup.auth_method.as_deref(), Some("xai-api-key"));
+        assert!(grok_setup.auth_ready);
+    }
+
+    #[test]
+    fn inherited_xai_api_key_marks_grok_ready() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("XAI_API_KEY", "xai-env-secret");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let status = setup_status_for(
+            GROK_RUNTIME_ID,
+            RuntimeSetupState {
+                custom_binary_path: Some(current_exe.display().to_string()),
+                ..RuntimeSetupState::default()
+            },
+        )
+        .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert!(status.binary_ready);
+        assert!(status.auth_ready);
+        assert!(!status.onboarding_required);
+        assert_eq!(status.auth_method.as_deref(), Some("xai-api-key"));
     }
 
     #[test]
@@ -8015,6 +8711,49 @@ mod tests {
     }
 
     #[test]
+    fn logout_marks_grok_external_auth_invalidated() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let ai = NativeAi::new(event_tx);
+        let temp = tempfile::tempdir().unwrap();
+
+        ai.update_setup(&json!({
+            "runtimeId": GROK_RUNTIME_ID,
+            "input": {
+                "custom_binary_path": temp.path().join("missing-grok"),
+            }
+        }))
+        .expect("setup should update");
+
+        let status = ai
+            .logout(&json!({
+                "runtimeId": GROK_RUNTIME_ID,
+                "vaultPath": temp.path()
+            }))
+            .expect("logout should clear local setup");
+
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(status.get("auth_method").and_then(Value::as_str), None);
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        let state = ai.inner.lock().unwrap();
+        let setup = state
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .expect("Grok setup should remain in memory");
+        assert!(setup.auth_invalidated_at_ms.is_some());
+    }
+
+    #[test]
     fn logout_does_not_require_acp_for_codex_api_keys() {
         let (event_tx, _event_rx) = mpsc::channel();
         let ai = NativeAi::new(event_tx);
@@ -8638,6 +9377,59 @@ mod tests {
     }
 
     #[test]
+    fn grok_session_uses_acp_models_without_static_model_list() {
+        let models_state = SessionModelState::new(
+            "grok-build",
+            vec![
+                ModelInfo::new("grok-composer-2.5-fast", "Composer 2.5")
+                    .description("Cursor's latest coding model"),
+                ModelInfo::new("grok-build", "Grok Build")
+                    .description("Best for advanced coding tasks"),
+            ],
+        );
+
+        let session = session_from_acp_response(
+            GROK_RUNTIME_ID,
+            "session-1".to_string(),
+            Some(models_state),
+            None,
+            None,
+        );
+
+        assert_eq!(session.model_id, "grok-build");
+        assert_eq!(
+            session
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["grok-composer-2.5-fast", "grok-build"]
+        );
+        let model_config = session
+            .config_options
+            .iter()
+            .find(|option| matches!(option.category, AiConfigOptionCategory::Model))
+            .expect("model config should be synthesized from ACP models");
+        assert_eq!(model_config.value, "grok-build");
+        assert!(session.modes.is_empty());
+        assert!(
+            session
+                .config_options
+                .iter()
+                .all(|option| !matches!(option.category, AiConfigOptionCategory::Mode)),
+            "Grok must not receive synthetic modes when ACP does not advertise them"
+        );
+        assert_eq!(
+            acp_config_option_remote_command(
+                &session.runtime_id,
+                &session.config_options,
+                &model_config.id
+            ),
+            AcpConfigOptionRemoteCommand::SetModel
+        );
+    }
+
+    #[test]
     fn acp_config_mapping_treats_effort_category_as_reasoning() {
         let mapped = map_session_config_options(
             CODEX_RUNTIME_ID,
@@ -8703,6 +9495,105 @@ mod tests {
         assert_eq!(
             acp_config_option_remote_command(CODEX_RUNTIME_ID, &options, "model"),
             AcpConfigOptionRemoteCommand::SetConfigOption
+        );
+    }
+
+    #[test]
+    fn grok_config_options_route_model_to_supported_acp_method() {
+        let options = map_session_config_options(
+            GROK_RUNTIME_ID,
+            vec![
+                SessionConfigOption::select(
+                    "model",
+                    "Model",
+                    "grok-build",
+                    vec![
+                        SessionConfigSelectOption::new("grok-composer-2.5-fast", "Composer 2.5"),
+                        SessionConfigSelectOption::new("grok-build", "Grok Build"),
+                    ],
+                )
+                .category(SessionConfigOptionCategory::Model),
+                SessionConfigOption::select(
+                    "mode",
+                    "Mode",
+                    "default",
+                    vec![SessionConfigSelectOption::new("default", "Default")],
+                )
+                .category(SessionConfigOptionCategory::Mode),
+            ],
+        );
+
+        assert_eq!(
+            acp_config_option_remote_command(GROK_RUNTIME_ID, &options, "model"),
+            AcpConfigOptionRemoteCommand::SetModel
+        );
+        assert_eq!(
+            acp_config_option_remote_command(GROK_RUNTIME_ID, &options, "mode"),
+            AcpConfigOptionRemoteCommand::LocalOnly
+        );
+        assert_eq!(
+            acp_config_option_remote_command(GROK_RUNTIME_ID, &[], "model"),
+            AcpConfigOptionRemoteCommand::SetModel
+        );
+    }
+
+    #[test]
+    fn grok_synthetic_modes_are_local_only() {
+        assert!(!runtime_supports_remote_mode_change(GROK_RUNTIME_ID));
+        assert!(runtime_supports_remote_mode_change(CODEX_RUNTIME_ID));
+    }
+
+    #[test]
+    fn acp_available_commands_update_is_forwarded_to_renderer() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let client = test_client(event_tx);
+
+        run_client_future(client.session_notification(SessionNotification::new(
+            "session-commands",
+            SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+                AvailableCommand::new("login", "Sign in to the provider"),
+                AvailableCommand::new("search", "Search the workspace").input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("query")),
+                ),
+            ])),
+        )))
+        .unwrap();
+
+        let event = event_rx
+            .recv_timeout(StdDuration::from_millis(250))
+            .expect("available commands event");
+        let RpcOutput::Event {
+            event_name,
+            payload,
+        } = event
+        else {
+            panic!("expected event");
+        };
+
+        assert_eq!(event_name, AI_AVAILABLE_COMMANDS_UPDATED_EVENT);
+        assert_eq!(
+            payload.pointer("/session_id").and_then(Value::as_str),
+            Some("session-commands")
+        );
+        assert_eq!(
+            payload.pointer("/commands/0/label").and_then(Value::as_str),
+            Some("/login")
+        );
+        assert_eq!(
+            payload
+                .pointer("/commands/0/insert_text")
+                .and_then(Value::as_str),
+            Some("/login")
+        );
+        assert_eq!(
+            payload.pointer("/commands/1/label").and_then(Value::as_str),
+            Some("/search")
+        );
+        assert_eq!(
+            payload
+                .pointer("/commands/1/insert_text")
+                .and_then(Value::as_str),
+            Some("/search ")
         );
     }
 
@@ -9431,6 +10322,37 @@ mod tests {
     }
 
     #[test]
+    fn detects_active_persisted_grok_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_file = temp.path().join(".grok").join("auth.json");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(
+            &auth_file,
+            r#"{"https://accounts.x.ai/sign-in":{"key":"redacted"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            persisted_cli_auth_method_for_home(GROK_RUNTIME_ID, temp.path(), false),
+            Some("grok-login".to_string())
+        );
+    }
+
+    #[test]
+    fn grok_login_auth_store_detects_non_empty_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_file = temp.path().join(".grok").join("auth.json");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(&auth_file, r#"{"token":"redacted"}"#).unwrap();
+
+        assert!(active_grok_auth_file_exists(temp.path(), None));
+        assert_eq!(
+            persisted_cli_auth_method_for_home(GROK_RUNTIME_ID, temp.path(), false),
+            Some("grok-login".to_string())
+        );
+    }
+
+    #[test]
     fn ignores_inactive_or_invalid_opencode_credentials() {
         let temp = tempfile::tempdir().unwrap();
         let auth_file = temp
@@ -9449,6 +10371,19 @@ mod tests {
                 "{raw:?} should not count as active OpenCode auth"
             );
         }
+    }
+
+    #[test]
+    fn ignores_empty_persisted_grok_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_file = temp.path().join(".grok").join("auth.json");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(&auth_file, "").unwrap();
+
+        assert_eq!(
+            persisted_cli_auth_method_for_home(GROK_RUNTIME_ID, temp.path(), false),
+            None
+        );
     }
 
     #[test]
@@ -9487,6 +10422,62 @@ mod tests {
             ),
             Some("opencode-login".to_string())
         );
+    }
+
+    #[test]
+    fn grok_auth_invalidation_blocks_stale_auth_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_file = temp.path().join(".grok").join("auth.json");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(&auth_file, r#"{"token":"redacted"}"#).unwrap();
+        let modified_at_ms = fs::metadata(&auth_file)
+            .unwrap()
+            .modified()
+            .ok()
+            .and_then(system_time_epoch_ms)
+            .unwrap();
+
+        assert_eq!(
+            persisted_cli_auth_method_for_home_with_invalidated_at(
+                GROK_RUNTIME_ID,
+                temp.path(),
+                false,
+                Some(modified_at_ms),
+            ),
+            None
+        );
+        assert_eq!(
+            persisted_cli_auth_method_for_home_with_invalidated_at(
+                GROK_RUNTIME_ID,
+                temp.path(),
+                false,
+                Some(modified_at_ms.saturating_sub(1)),
+            ),
+            Some("grok-login".to_string())
+        );
+    }
+
+    #[test]
+    fn grok_login_respects_auth_invalidated_at_ms() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_file = temp.path().join(".grok").join("auth.json");
+        fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
+        fs::write(&auth_file, r#"{"token":"redacted"}"#).unwrap();
+        let modified_at_ms = fs::metadata(&auth_file)
+            .unwrap()
+            .modified()
+            .ok()
+            .and_then(system_time_epoch_ms)
+            .unwrap();
+
+        assert!(!active_grok_auth_file_exists(
+            temp.path(),
+            Some(modified_at_ms)
+        ));
+        assert!(active_grok_auth_file_exists(
+            temp.path(),
+            Some(modified_at_ms.saturating_sub(1))
+        ));
     }
 
     #[test]
@@ -9572,6 +10563,48 @@ mod tests {
     }
 
     #[test]
+    fn auth_terminal_launch_config_uses_grok_login_command() {
+        let current_exe = std::env::current_exe().unwrap();
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            ..RuntimeSetupState::default()
+        };
+
+        let config = auth_terminal_launch_config(
+            GROK_RUNTIME_ID,
+            "grok-login",
+            &setup,
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(default_terminal_auth_method(GROK_RUNTIME_ID), "grok-login");
+        assert_eq!(config.args, vec!["login".to_string()]);
+        assert_eq!(config.display_name, "Grok Login");
+    }
+
+    #[test]
+    fn auth_terminal_launch_config_starts_grok_login() {
+        let current_exe = std::env::current_exe().unwrap();
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            ..RuntimeSetupState::default()
+        };
+
+        let config = auth_terminal_launch_config(
+            GROK_RUNTIME_ID,
+            "grok-login",
+            &setup,
+            std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(config.program, current_exe);
+        assert_eq!(config.args, vec!["login".to_string()]);
+        assert_eq!(config.display_name, "Grok Login");
+    }
+
+    #[test]
     fn auth_terminal_launch_config_forces_gemini_google_login_method() {
         let current_exe = std::env::current_exe().unwrap();
         let setup = RuntimeSetupState {
@@ -9623,6 +10656,18 @@ mod tests {
     }
 
     #[test]
+    fn grok_auth_terminal_success_output_is_detected_before_exit() {
+        assert!(auth_terminal_output_indicates_success(
+            GROK_RUNTIME_ID,
+            "Grok login successful"
+        ));
+        assert!(!auth_terminal_output_indicates_success(
+            GROK_RUNTIME_ID,
+            "Grok login required"
+        ));
+    }
+
+    #[test]
     fn runtime_secret_store_mode_requires_explicit_memory_value() {
         assert_eq!(
             runtime_secret_store_mode_from_env(Some("memory")),
@@ -9652,11 +10697,13 @@ mod tests {
         let store_path = temp.path().join("runtime-setup.json");
         let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
         let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+        let current_exe = std::env::current_exe().unwrap();
 
         native_ai
             .update_setup(&json!({
                 "runtime_id": GEMINI_RUNTIME_ID,
                 "input": {
+                    "custom_binary_path": current_exe,
                     "gemini_api_key": {
                         "action": "set",
                         "value": "gemini-test-secret",
@@ -9691,11 +10738,13 @@ mod tests {
         let store_path = temp.path().join("runtime-setup.json");
         let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
         let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+        let current_exe = std::env::current_exe().unwrap();
 
         native_ai
             .update_setup(&json!({
                 "runtime_id": KILO_RUNTIME_ID,
                 "input": {
+                    "custom_binary_path": current_exe,
                     "kilo_api_key": {
                         "action": "set",
                         "value": "kilo-test-secret",
@@ -9722,6 +10771,311 @@ mod tests {
             Some("kilo-api-key")
         );
         assert!(!status.to_string().contains("kilo-test-secret"));
+    }
+
+    #[test]
+    fn grok_xai_api_key_setup_persists_across_native_ai_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+        let current_exe = std::env::current_exe().unwrap();
+
+        let status = native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": current_exe,
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-test-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            status.get("auth_method").and_then(Value::as_str),
+            Some("xai-api-key")
+        );
+
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(!encoded.contains("xai-test-secret"));
+        assert!(encoded.contains("XAI_API_KEY"));
+
+        let rehydrated_native_ai = test_native_ai_with_secret_store(store_path, secrets);
+        let status = rehydrated_native_ai
+            .get_setup_status(&json!({ "runtime_id": GROK_RUNTIME_ID }))
+            .unwrap();
+
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            status.get("auth_method").and_then(Value::as_str),
+            Some("xai-api-key")
+        );
+        assert!(!status.to_string().contains("xai-test-secret"));
+    }
+
+    #[test]
+    fn grok_xai_api_key_is_secret_keyring_value() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+        let current_exe = std::env::current_exe().unwrap();
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": current_exe,
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-keyring-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(encoded.contains("XAI_API_KEY"));
+        assert!(!encoded.contains("xai-keyring-secret"));
+        assert_eq!(
+            secrets.stored_secret(GROK_RUNTIME_ID, "XAI_API_KEY"),
+            Some("xai-keyring-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn grok_auth_error_detector_matches_cli_auth_failures() {
+        for error in [
+            "Please run grok login to continue",
+            "set XAI_API_KEY before starting",
+            "authentication required",
+            "auth_required",
+            "Unauthorized request",
+            "HTTP 401",
+            "invalid api key",
+            "cached_token is expired",
+        ] {
+            assert!(is_grok_auth_error(error), "{error:?} should be detected");
+        }
+
+        assert!(!is_grok_auth_error("model does not support that option"));
+    }
+
+    #[test]
+    fn grok_login_auth_error_marks_external_auth_invalidated() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let native_ai = test_native_ai_with_secret_store(
+            store_path.clone(),
+            Arc::new(InMemoryRuntimeSecretStore::default()),
+        );
+        let setup_at_start = RuntimeSetupState {
+            auth_method: Some("grok-login".to_string()),
+            auth_ready: true,
+            ..RuntimeSetupState::default()
+        };
+        native_ai
+            .inner
+            .lock()
+            .unwrap()
+            .setup
+            .insert(GROK_RUNTIME_ID.to_string(), setup_at_start.clone());
+
+        native_ai
+            .invalidate_grok_auth_after_session_start_error(
+                GROK_RUNTIME_ID,
+                &setup_at_start,
+                "cached_token unauthorized",
+            )
+            .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        let setup = native_ai
+            .inner
+            .lock()
+            .unwrap()
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .cloned()
+            .expect("Grok setup should remain");
+        assert_eq!(setup.auth_method.as_deref(), Some("grok-login"));
+        assert!(!setup.auth_ready);
+        assert!(setup.auth_invalidated_at_ms.is_some());
+        assert_eq!(
+            setup.message.as_deref(),
+            Some(GROK_LOGIN_INVALIDATED_MESSAGE)
+        );
+
+        let persisted_setup = native_ai
+            .setup_store
+            .load()
+            .unwrap()
+            .remove(GROK_RUNTIME_ID)
+            .expect("Grok setup should persist invalidated login");
+        assert_eq!(persisted_setup.auth_method.as_deref(), Some("grok-login"));
+        assert!(persisted_setup.auth_invalidated_at_ms.is_some());
+    }
+
+    #[test]
+    fn grok_stored_xai_key_auth_error_clears_local_secret() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path, secrets.clone());
+        let current_exe = std::env::current_exe().unwrap();
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": current_exe,
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-stored-secret",
+                    },
+                },
+            }))
+            .unwrap();
+        assert_eq!(
+            secrets.stored_secret(GROK_RUNTIME_ID, "XAI_API_KEY"),
+            Some("xai-stored-secret".to_string())
+        );
+
+        let setup_at_start = native_ai
+            .inner
+            .lock()
+            .unwrap()
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .cloned()
+            .expect("Grok setup should exist");
+        native_ai
+            .invalidate_grok_auth_after_session_start_error(
+                GROK_RUNTIME_ID,
+                &setup_at_start,
+                "401 invalid api key",
+            )
+            .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(secrets.stored_secret(GROK_RUNTIME_ID, "XAI_API_KEY"), None);
+        let setup = native_ai
+            .inner
+            .lock()
+            .unwrap()
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .cloned()
+            .expect("Grok setup should remain");
+        assert_eq!(setup.auth_method, None);
+        assert!(!setup.auth_ready);
+        assert_eq!(
+            setup.message.as_deref(),
+            Some(GROK_STORED_XAI_API_KEY_INVALID_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn grok_inherited_xai_key_auth_error_preserves_local_secret() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("XAI_API_KEY", "xai-env-secret");
+
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(FailableRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path, secrets.clone());
+        let current_exe = std::env::current_exe().unwrap();
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "custom_binary_path": current_exe,
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-stored-secret",
+                    },
+                },
+            }))
+            .unwrap();
+
+        let setup_at_start = native_ai
+            .inner
+            .lock()
+            .unwrap()
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .cloned()
+            .expect("Grok setup should exist");
+        native_ai
+            .invalidate_grok_auth_after_session_start_error(
+                GROK_RUNTIME_ID,
+                &setup_at_start,
+                "unauthorized",
+            )
+            .unwrap();
+
+        let status = native_ai
+            .get_setup_status(&json!({ "runtime_id": GROK_RUNTIME_ID }))
+            .unwrap();
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(
+            secrets.stored_secret(GROK_RUNTIME_ID, "XAI_API_KEY"),
+            Some("xai-stored-secret".to_string())
+        );
+        assert_eq!(
+            status.get("auth_ready").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status.get("auth_method").and_then(Value::as_str),
+            Some("xai-api-key")
+        );
+        assert_eq!(
+            status.get("message").and_then(Value::as_str),
+            Some(GROK_INHERITED_XAI_API_KEY_INVALID_MESSAGE)
+        );
     }
 
     #[test]
@@ -9753,6 +11107,37 @@ mod tests {
             .expect("OpenCode setup should reload");
         assert_eq!(opencode.auth_method.as_deref(), Some("opencode-login"));
         assert_eq!(opencode.auth_invalidated_at_ms, Some(123));
+    }
+
+    #[test]
+    fn grok_login_selection_persists_without_local_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let store = RuntimeSetupStore::with_secret_store(
+            store_path.clone(),
+            Arc::new(InMemoryRuntimeSecretStore::default()),
+        );
+        let mut setup = HashMap::new();
+        setup.insert(
+            GROK_RUNTIME_ID.to_string(),
+            RuntimeSetupState {
+                auth_method: Some("grok-login".to_string()),
+                auth_invalidated_at_ms: Some(123),
+                ..RuntimeSetupState::default()
+            },
+        );
+
+        store.save(&setup).unwrap();
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(encoded.contains("grok-login"));
+        assert!(encoded.contains("auth_invalidated_at_ms"));
+
+        let loaded = store.load().unwrap();
+        let grok = loaded
+            .get(GROK_RUNTIME_ID)
+            .expect("Grok setup should reload");
+        assert_eq!(grok.auth_method.as_deref(), Some("grok-login"));
+        assert_eq!(grok.auth_invalidated_at_ms, Some(123));
     }
 
     #[test]
@@ -9803,6 +11188,57 @@ mod tests {
             .get(OPENCODE_RUNTIME_ID)
             .expect("OpenCode setup should persist verified method");
         assert_eq!(verified.auth_method.as_deref(), Some("opencode-login"));
+        assert_eq!(verified.auth_invalidated_at_ms, None);
+    }
+
+    #[test]
+    fn grok_pending_terminal_auth_preserves_disconnect_invalidation_until_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let native_ai = test_native_ai_with_secret_store(
+            store_path.clone(),
+            Arc::new(InMemoryRuntimeSecretStore::default()),
+        );
+
+        native_ai
+            .persist_auth_terminal_pending_setup(
+                GROK_RUNTIME_ID,
+                "grok-login",
+                RuntimeSetupState {
+                    auth_invalidated_at_ms: Some(123),
+                    suppress_persisted_auth: true,
+                    ..RuntimeSetupState::default()
+                },
+            )
+            .unwrap();
+
+        let grok = native_ai
+            .inner
+            .lock()
+            .unwrap()
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .cloned()
+            .expect("Grok setup should be pending");
+        assert_eq!(grok.auth_method.as_deref(), Some("grok-login"));
+        assert!(!grok.auth_ready);
+        assert_eq!(grok.auth_invalidated_at_ms, Some(123));
+
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(encoded.contains("auth_invalidated_at_ms"));
+
+        mark_runtime_auth_verified(
+            &native_ai.inner,
+            Some(&native_ai.setup_store),
+            GROK_RUNTIME_ID,
+            "grok-login",
+        );
+
+        let loaded = native_ai.setup_store.load().unwrap();
+        let verified = loaded
+            .get(GROK_RUNTIME_ID)
+            .expect("Grok setup should persist verified method");
+        assert_eq!(verified.auth_method.as_deref(), Some("grok-login"));
         assert_eq!(verified.auth_invalidated_at_ms, None);
     }
 
@@ -9943,30 +11379,41 @@ mod tests {
                 },
             }))
             .unwrap();
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "xai_api_key": { "action": "set", "value": "xai-secret" },
+                },
+            }))
+            .unwrap();
 
         let encoded = fs::read_to_string(&store_path).unwrap();
         assert!(!encoded.contains("gemini-secret"));
         assert!(!encoded.contains("openai-secret"));
         assert!(!encoded.contains("claude-secret"));
         assert!(!encoded.contains("kilo-secret"));
+        assert!(!encoded.contains("xai-secret"));
         assert!(encoded.contains("\"secret_env_keys\""));
         assert!(encoded.contains("GEMINI_API_KEY"));
         assert!(encoded.contains("OPENAI_API_KEY"));
         assert!(encoded.contains("ANTHROPIC_API_KEY"));
         assert!(encoded.contains("KILO_API_KEY"));
+        assert!(encoded.contains("XAI_API_KEY"));
     }
 
     #[test]
     fn legacy_plaintext_runtime_setup_is_migrated_to_secret_store() {
         let temp = tempfile::tempdir().unwrap();
         let store_path = temp.path().join("runtime-setup.json");
+        let current_exe = std::env::current_exe().unwrap();
         fs::write(
             &store_path,
             serde_json::to_string_pretty(&json!({
                 "version": 1,
                 "runtimes": {
                     GEMINI_RUNTIME_ID: {
-                        "custom_binary_path": null,
+                        "custom_binary_path": current_exe,
                         "auth_method": "use_gemini",
                         "env": {
                             "GEMINI_API_KEY": "legacy-gemini-secret"
@@ -10143,6 +11590,51 @@ mod tests {
     }
 
     #[test]
+    fn logout_removes_persisted_grok_xai_api_key_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("runtime-setup.json");
+        let secrets = Arc::new(InMemoryRuntimeSecretStore::default());
+        let native_ai = test_native_ai_with_secret_store(store_path.clone(), secrets.clone());
+
+        native_ai
+            .update_setup(&json!({
+                "runtime_id": GROK_RUNTIME_ID,
+                "input": {
+                    "xai_api_key": {
+                        "action": "set",
+                        "value": "xai-test-secret",
+                    },
+                },
+            }))
+            .unwrap();
+        assert!(store_path.exists());
+
+        native_ai
+            .logout(&json!({ "runtime_id": GROK_RUNTIME_ID }))
+            .unwrap();
+
+        let encoded = fs::read_to_string(&store_path).unwrap();
+        assert!(encoded.contains("auth_invalidated_at_ms"));
+        assert!(!encoded.contains("xai-test-secret"));
+        assert!(!encoded.contains("XAI_API_KEY"));
+        assert_eq!(
+            secrets
+                .get_secret(GROK_RUNTIME_ID, "XAI_API_KEY")
+                .expect("secret store should remain readable"),
+            None
+        );
+        let setup = native_ai.inner.lock().unwrap();
+        let grok_setup = setup
+            .setup
+            .get(GROK_RUNTIME_ID)
+            .expect("Grok setup entry should remain in memory");
+        assert!(!grok_setup.env.contains_key("XAI_API_KEY"));
+        assert_eq!(grok_setup.auth_method, None);
+        assert!(!grok_setup.auth_ready);
+        assert!(grok_setup.auth_invalidated_at_ms.is_some());
+    }
+
+    #[test]
     fn logout_secret_store_failure_does_not_commit_memory() {
         let temp = tempfile::tempdir().unwrap();
         let store_path = temp.path().join("runtime-setup.json");
@@ -10252,6 +11744,373 @@ mod tests {
             spec.env.get("KILO_API_KEY").map(String::as_str),
             Some("kilo-test-secret")
         );
+    }
+
+    #[test]
+    fn acp_process_spec_injects_xai_api_key_from_setup_env() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut env = HashMap::new();
+        env.insert("XAI_API_KEY".to_string(), "xai-test-secret".to_string());
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("xai-api-key".to_string()),
+            env,
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(
+            spec.env.get("XAI_API_KEY").map(String::as_str),
+            Some("xai-test-secret")
+        );
+        assert_eq!(spec.auth_method.as_deref(), Some("xai-api-key"));
+
+        let handshake_request = acp_auth_handshake_request(&spec)
+            .expect("Grok handshake should map API key auth")
+            .expect("Grok API key auth should request an ACP authenticate call");
+
+        assert_eq!(handshake_request.method_id, "xai.api_key");
+        assert_eq!(
+            handshake_request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("headless"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_acp_process_spec_uses_no_auto_update_agent_stdio() {
+        let current_exe = std::env::current_exe().unwrap();
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+
+        assert_eq!(spec.program, current_exe);
+        assert_eq!(
+            spec.args,
+            vec![
+                "--no-auto-update".to_string(),
+                "agent".to_string(),
+                "stdio".to_string()
+            ]
+        );
+        assert_eq!(spec.runtime_id, GROK_RUNTIME_ID);
+        assert!(spec.auth_handshake.is_some());
+    }
+
+    #[test]
+    fn grok_auth_handshake_selects_xai_api_key() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut env = HashMap::new();
+        env.insert("XAI_API_KEY".to_string(), "xai-test-secret".to_string());
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("xai-api-key".to_string()),
+            env,
+            ..RuntimeSetupState::default()
+        };
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+        let handshake_request = acp_auth_handshake_request(&spec)
+            .expect("Grok handshake should map API key auth")
+            .expect("Grok API key auth should request an ACP authenticate call");
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(handshake_request.method_id, "xai.api_key");
+        assert_eq!(
+            handshake_request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("headless"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn acp_process_spec_lets_inherited_xai_api_key_override_stored_secret() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("XAI_API_KEY", "xai-env-secret");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut env = HashMap::new();
+        env.insert("XAI_API_KEY".to_string(), "xai-stored-secret".to_string());
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("xai-api-key".to_string()),
+            env,
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+
+        assert_eq!(
+            inherited_auth_method(GROK_RUNTIME_ID, true, None),
+            Some("xai-api-key".to_string())
+        );
+        assert_eq!(spec.env.get("XAI_API_KEY"), None);
+        assert_eq!(spec.auth_method.as_deref(), Some("xai-api-key"));
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn acp_process_spec_lets_ready_stored_xai_key_override_inherited_secret() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("XAI_API_KEY", "xai-env-secret");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut env = HashMap::new();
+        env.insert("XAI_API_KEY".to_string(), "xai-stored-secret".to_string());
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("xai-api-key".to_string()),
+            auth_ready: true,
+            env,
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+
+        assert_eq!(
+            spec.env.get("XAI_API_KEY").map(String::as_str),
+            Some("xai-stored-secret")
+        );
+        assert_eq!(spec.auth_method.as_deref(), Some("xai-api-key"));
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn acp_auth_handshake_maps_grok_login_to_cached_token() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("grok-login".to_string()),
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+        let handshake_request = acp_auth_handshake_request(&spec)
+            .expect("Grok handshake should map login auth")
+            .expect("Grok login auth should request an ACP authenticate call");
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(handshake_request.method_id, "cached_token");
+        assert_eq!(
+            handshake_request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("headless"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn grok_auth_handshake_selects_cached_token() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("grok-login".to_string()),
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+        let handshake_request = acp_auth_handshake_request(&spec)
+            .expect("Grok handshake should map login auth")
+            .expect("Grok login auth should request an ACP authenticate call");
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert_eq!(handshake_request.method_id, "cached_token");
+        assert_eq!(
+            handshake_request
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("headless"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn acp_auth_handshake_uses_inherited_xai_key_when_grok_login_is_unverified() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("XAI_API_KEY", "xai-env-secret");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("grok-login".to_string()),
+            auth_ready: false,
+            ..RuntimeSetupState::default()
+        };
+
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+        let handshake_request = acp_auth_handshake_request(&spec)
+            .expect("Grok handshake should map inherited API key auth")
+            .expect("Inherited xAI API key should request an ACP authenticate call");
+
+        assert_eq!(spec.auth_method.as_deref(), Some("xai-api-key"));
+        assert_eq!(handshake_request.method_id, "xai.api_key");
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn acp_auth_handshake_is_grok_only_and_requires_selected_auth() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let grok_setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            suppress_persisted_auth: true,
+            ..RuntimeSetupState::default()
+        };
+        let grok_spec = acp_process_spec(
+            GROK_RUNTIME_ID,
+            &grok_setup,
+            std::env::current_dir().unwrap(),
+        )
+        .expect("Grok ACP process spec should resolve");
+
+        assert!(acp_auth_handshake_request(&grok_spec)
+            .expect("Missing selected auth should not fail")
+            .is_none());
+
+        let codex_setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("codex-api-key".to_string()),
+            ..RuntimeSetupState::default()
+        };
+        let codex_spec = acp_process_spec(
+            CODEX_RUNTIME_ID,
+            &codex_setup,
+            std::env::current_dir().unwrap(),
+        )
+        .expect("Codex ACP process spec should resolve");
+
+        assert!(acp_auth_handshake_request(&codex_spec)
+            .expect("Non-Grok runtime should not need a handshake")
+            .is_none());
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn acp_initialize_response_auth_method_validation_matches_acp_ids() {
+        let response = InitializeResponse::new(ProtocolVersion::LATEST).auth_methods(vec![
+            agent_client_protocol::schema::AuthMethod::Agent(
+                agent_client_protocol::schema::AuthMethodAgent::new("cached_token", "Cached token"),
+            ),
+        ]);
+
+        assert!(acp_initialize_response_has_auth_method(
+            &response,
+            "cached_token"
+        ));
+        assert!(!acp_initialize_response_has_auth_method(
+            &response,
+            "xai.api_key"
+        ));
+    }
+
+    #[test]
+    fn grok_auth_handshake_rejects_missing_advertised_method() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let previous = std::env::var_os("XAI_API_KEY");
+        std::env::remove_var("XAI_API_KEY");
+
+        let current_exe = std::env::current_exe().unwrap();
+        let mut env = HashMap::new();
+        env.insert("XAI_API_KEY".to_string(), "xai-test-secret".to_string());
+        let setup = RuntimeSetupState {
+            custom_binary_path: Some(current_exe.display().to_string()),
+            auth_method: Some("xai-api-key".to_string()),
+            env,
+            ..RuntimeSetupState::default()
+        };
+        let spec = acp_process_spec(GROK_RUNTIME_ID, &setup, std::env::current_dir().unwrap())
+            .expect("Grok ACP process spec should resolve");
+        let response = InitializeResponse::new(ProtocolVersion::LATEST).auth_methods(vec![
+            agent_client_protocol::schema::AuthMethod::Agent(
+                agent_client_protocol::schema::AuthMethodAgent::new("cached_token", "Cached token"),
+            ),
+        ]);
+
+        let error = validate_acp_auth_handshake_request(&spec, &response)
+            .expect_err("Missing xai.api_key should be rejected");
+
+        match previous {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+
+        assert!(error.contains("Grok ACP runtime did not advertise"));
+        assert!(error.contains("xai.api_key"));
     }
 
     #[test]

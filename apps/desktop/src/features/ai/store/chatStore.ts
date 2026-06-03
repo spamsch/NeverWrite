@@ -1177,6 +1177,10 @@ interface ChatStore {
     runtimes: AIRuntimeDescriptor[];
     sessionsById: Record<string, AIChatSession>;
     sessionOrder: string[];
+    pendingAvailableCommandsBySessionId: Record<
+        string,
+        AIAvailableCommandsPayload["commands"]
+    >;
     activeSessionId: string | null;
     lastFocusedSessionId: string | null;
     defaultRuntimeId: string | null;
@@ -1223,6 +1227,7 @@ interface ChatStore {
         codexApiKey: AISecretPatch;
         openaiApiKey: AISecretPatch;
         geminiApiKey: AISecretPatch;
+        xaiApiKey?: AISecretPatch;
         kiloApiKey?: AISecretPatch;
         googleApiKey: AISecretPatch;
         googleCloudProject?: string;
@@ -1242,6 +1247,7 @@ interface ChatStore {
         codexApiKey: AISecretPatch;
         openaiApiKey: AISecretPatch;
         geminiApiKey: AISecretPatch;
+        xaiApiKey?: AISecretPatch;
         kiloApiKey?: AISecretPatch;
         googleApiKey: AISecretPatch;
         googleCloudProject?: string;
@@ -6773,6 +6779,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
         runtimes: [],
         sessionsById: {},
         sessionOrder: [],
+        pendingAvailableCommandsBySessionId: {},
         activeSessionId: null,
         lastFocusedSessionId: null,
         defaultRuntimeId: null,
@@ -7455,6 +7462,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     secretPatchChanged(input.openaiApiKey) ||
                     secretPatchChanged(input.geminiApiKey) ||
                     secretPatchChanged(
+                        input.xaiApiKey ?? { action: "unchanged" },
+                    ) ||
+                    secretPatchChanged(
                         input.kiloApiKey ?? { action: "unchanged" },
                     ) ||
                     secretPatchChanged(input.googleApiKey) ||
@@ -7476,6 +7486,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         codexApiKey: input.codexApiKey,
                         openaiApiKey: input.openaiApiKey,
                         geminiApiKey: input.geminiApiKey,
+                        xaiApiKey: input.xaiApiKey,
                         kiloApiKey: input.kiloApiKey,
                         googleApiKey: input.googleApiKey,
                         googleCloudProject: input.googleCloudProject,
@@ -7640,6 +7651,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 if (closedQueueState) {
                     nextSession = closedQueueState.session;
                 }
+                const pendingAvailableCommands =
+                    state.pendingAvailableCommandsBySessionId[
+                        scopedSession.sessionId
+                    ];
+                if (pendingAvailableCommands) {
+                    nextSession = {
+                        ...nextSession,
+                        availableCommands: pendingAvailableCommands,
+                    };
+                }
                 const nextTokenUsageBySessionId =
                     existing && existing.modelId !== nextSession.modelId
                         ? removeSessionMapEntry(
@@ -7671,6 +7692,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         ...state.sessionsById,
                         [scopedSession.sessionId]: nextSession,
                     },
+                    pendingAvailableCommandsBySessionId:
+                        pendingAvailableCommands
+                            ? removeSessionMapEntry(
+                                  state.pendingAvailableCommandsBySessionId,
+                                  scopedSession.sessionId,
+                              )
+                            : state.pendingAvailableCommandsBySessionId,
                     sessionOrder: activate
                         ? touchSessionOrder(
                               state.sessionOrder,
@@ -8508,7 +8536,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
         applyAvailableCommandsUpdate: (payload) => {
             set((state) => {
                 const session = state.sessionsById[payload.session_id];
-                if (!session) return state;
+                if (!session) {
+                    // ACP runtimes may publish commands during startup, before
+                    // the frontend has accepted the corresponding session.
+                    return {
+                        pendingAvailableCommandsBySessionId: {
+                            ...state.pendingAvailableCommandsBySessionId,
+                            [payload.session_id]: payload.commands,
+                        },
+                    };
+                }
 
                 return {
                     sessionsById: {
@@ -11110,6 +11147,10 @@ export const useChatStore = create<ChatStore>((set, get) => {
             set({
                 sessionsById: nextSessionsById,
                 sessionOrder: remainingIds,
+                pendingAvailableCommandsBySessionId: removeSessionMapEntry(
+                    state.pendingAvailableCommandsBySessionId,
+                    sessionId,
+                ),
                 activeSessionId: nextActiveId,
                 lastFocusedSessionId: nextLastFocusedSessionId,
                 selectedRuntimeId: nextSelectedRuntimeId,
@@ -11178,6 +11219,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
             set({
                 sessionsById: {},
                 sessionOrder: [],
+                pendingAvailableCommandsBySessionId: {},
                 activeSessionId: null,
                 lastFocusedSessionId: null,
                 selectedRuntimeId: defaultRuntimeId,
@@ -11737,6 +11779,7 @@ export function resetChatStore() {
         runtimes: [],
         sessionsById: {},
         sessionOrder: [],
+        pendingAvailableCommandsBySessionId: {},
         activeSessionId: null,
         lastFocusedSessionId: null,
         defaultRuntimeId: null,
