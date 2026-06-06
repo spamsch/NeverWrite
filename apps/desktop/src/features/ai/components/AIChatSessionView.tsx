@@ -9,7 +9,14 @@
  * All session data is read reactively from chatStore, which is the single
  * source of truth regardless of where the UI renders.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    useCallback,
+    useEffect,
+    useMemo,
+    useRef,
+    useState,
+    type ReactNode,
+} from "react";
 import { open as runtimeOpen } from "@neverwrite/runtime";
 import { useShallow } from "zustand/react/shallow";
 import {
@@ -37,6 +44,7 @@ import { QueuedMessagesPanel } from "./QueuedMessagesPanel";
 import { AIChatRuntimeBanner } from "./AIChatRuntimeBanner";
 import { AIDiscardedRootsBanner } from "./AIDiscardedRootsBanner";
 import { useInlineRename } from "./useInlineRename";
+import { AI_CHAT_CONTENT_COLUMN_STYLE } from "./chatContentLayout";
 import {
     appendFileAttachmentPart,
     appendScreenshotPart,
@@ -59,6 +67,22 @@ const IDLE_CONNECTION: AIRuntimeConnectionState = {
     status: "idle",
     message: null,
 };
+
+function ChatContentColumn({
+    children,
+}: {
+    children: ReactNode;
+}) {
+    return (
+        <div
+            className="min-w-0"
+            data-testid="chat-content-column"
+            style={AI_CHAT_CONTENT_COLUMN_STYLE}
+        >
+            {children}
+        </div>
+    );
+}
 
 interface AIChatSessionViewProps {
     paneId?: string;
@@ -555,7 +579,9 @@ export function AIChatSessionView({ paneId }: AIChatSessionViewProps) {
                 />
             )}
 
-            <EditedFilesBufferPanel sessionId={sessionId} />
+            <ChatContentColumn>
+                <EditedFilesBufferPanel sessionId={sessionId} />
+            </ChatContentColumn>
 
             <div
                 className={
@@ -564,28 +590,33 @@ export function AIChatSessionView({ paneId }: AIChatSessionViewProps) {
                         : "pt-2"
                 }
             >
-                <QueuedMessagesPanel
-                    items={queuedMessages}
-                    editingItem={queuedMessageEdit?.item ?? null}
-                    onCancel={(messageId) => {
-                        chatActions.removeQueuedMessage(sessionId, messageId);
-                    }}
-                    onClearAll={() => {
-                        chatActions.clearSessionQueue(sessionId);
-                    }}
-                    onEdit={(messageId) => {
-                        chatActions.editQueuedMessage(sessionId, messageId);
-                    }}
-                    onSendNow={(messageId) => {
-                        void chatActions.sendQueuedMessageNow(
-                            sessionId,
-                            messageId,
-                        );
-                    }}
-                    onCancelEdit={() => {
-                        chatActions.cancelQueuedMessageEdit(sessionId);
-                    }}
-                />
+                <ChatContentColumn>
+                    <QueuedMessagesPanel
+                        items={queuedMessages}
+                        editingItem={queuedMessageEdit?.item ?? null}
+                        onCancel={(messageId) => {
+                            chatActions.removeQueuedMessage(
+                                sessionId,
+                                messageId,
+                            );
+                        }}
+                        onClearAll={() => {
+                            chatActions.clearSessionQueue(sessionId);
+                        }}
+                        onEdit={(messageId) => {
+                            chatActions.editQueuedMessage(sessionId, messageId);
+                        }}
+                        onSendNow={(messageId) => {
+                            void chatActions.sendQueuedMessageNow(
+                                sessionId,
+                                messageId,
+                            );
+                        }}
+                        onCancelEdit={() => {
+                            chatActions.cancelQueuedMessageEdit(sessionId);
+                        }}
+                    />
+                </ChatContentColumn>
                 <AIChatComposer
                     key={sessionId}
                     sessionId={sessionId}
@@ -619,7 +650,7 @@ export function AIChatSessionView({ paneId }: AIChatSessionViewProps) {
                               ? pendingSessionError
                                   ? "Agent unavailable"
                                   : "Loading agent"
-                            : undefined
+                              : undefined
                     }
                     contextBar={
                         <AIChatContextBar
