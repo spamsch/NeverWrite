@@ -1,5 +1,5 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
-import { invoke } from "@neverwrite/runtime";
+import { getCurrentWebview, invoke } from "@neverwrite/runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useSettingsStore } from "../../../app/store/settingsStore";
 import type { EditorFontFamily } from "../../../app/store/settingsStore";
@@ -13,6 +13,10 @@ import {
 } from "../../../test/test-utils";
 import { FILE_TREE_NOTE_DRAG_EVENT } from "../dragEvents";
 import type { AIAvailableCommand, AIComposerPart } from "../types";
+import {
+    MAX_IMAGE_ATTACHMENTS_PER_MESSAGE,
+    MAX_IMAGE_ATTACHMENT_BYTES,
+} from "../imageAttachments";
 import { AIChatComposer } from "./AIChatComposer";
 import { AI_CHAT_CONTENT_MAX_WIDTH_PX } from "./chatContentLayout";
 import { getComposerPillLayoutStyle } from "./chatPillLayout";
@@ -47,6 +51,7 @@ function renderComposer({
     onMentionAttach = vi.fn(),
     onFolderAttach = vi.fn(),
     onToggleExpanded = vi.fn(),
+    onImageAttachmentValidationFailure = vi.fn(),
     onSubmit = () => {},
     onStop = () => {},
 }: {
@@ -68,6 +73,7 @@ function renderComposer({
     }) => void;
     onFolderAttach?: (folderPath: string, name: string) => void;
     onToggleExpanded?: () => void;
+    onImageAttachmentValidationFailure?: (reason: string) => void;
     onSubmit?: () => void;
     onStop?: () => void;
 } = {}) {
@@ -98,6 +104,9 @@ function renderComposer({
             onChange={onChange}
             onMentionAttach={onMentionAttach}
             onFolderAttach={onFolderAttach}
+            onImageAttachmentValidationFailure={
+                onImageAttachmentValidationFailure
+            }
             onSubmit={onSubmit}
             onStop={onStop}
         />,
@@ -106,7 +115,15 @@ function renderComposer({
     const composer = screen.getByRole("textbox", {
         name: "Message NeverWrite",
     });
-    return { composer, onChange, onFolderAttach, onMentionAttach, onSubmit, onStop };
+    return {
+        composer,
+        onChange,
+        onFolderAttach,
+        onMentionAttach,
+        onImageAttachmentValidationFailure,
+        onSubmit,
+        onStop,
+    };
 }
 
 function setCaret(node: Node, offset: number) {
@@ -328,6 +345,201 @@ describe("AIChatComposer mention picker", () => {
             "research",
         );
         expect(onMentionAttach).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects unsupported image files from file-tree attach", async () => {
+        const { onChange, onImageAttachmentValidationFailure } = renderComposer();
+
+        act(() => {
+            window.dispatchEvent(
+                new CustomEvent(FILE_TREE_NOTE_DRAG_EVENT, {
+                    detail: {
+                        phase: "attach",
+                        x: 0,
+                        y: 0,
+                        notes: [],
+                        files: [
+                            {
+                                filePath: "/vault/assets/vector.svg",
+                                fileName: "vector.svg",
+                                mimeType: "image/svg+xml",
+                            },
+                        ],
+                    },
+                }),
+            );
+        });
+
+        await waitFor(() => {
+            expect(onImageAttachmentValidationFailure).toHaveBeenCalledWith(
+                "unsupported_type",
+            );
+        });
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it("rejects oversized image files from file-tree attach when size metadata is available", async () => {
+        const { onChange, onImageAttachmentValidationFailure } = renderComposer();
+
+        act(() => {
+            window.dispatchEvent(
+                new CustomEvent(FILE_TREE_NOTE_DRAG_EVENT, {
+                    detail: {
+                        phase: "attach",
+                        x: 0,
+                        y: 0,
+                        notes: [],
+                        files: [
+                            {
+                                filePath: "/vault/assets/huge.png",
+                                fileName: "huge.png",
+                                mimeType: "image/png",
+                                sizeBytes: MAX_IMAGE_ATTACHMENT_BYTES + 1,
+                            },
+                        ],
+                    },
+                }),
+            );
+        });
+
+        await waitFor(() => {
+            expect(onImageAttachmentValidationFailure).toHaveBeenCalledWith(
+                "too_large",
+            );
+        });
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it("rejects file-tree image attachments above the per-message count", async () => {
+        const parts = Array.from(
+            { length: MAX_IMAGE_ATTACHMENTS_PER_MESSAGE },
+            (_, index): AIComposerPart => ({
+                id: `shot-${index}`,
+                type: "screenshot",
+                filePath: `/vault/assets/chat/shot-${index}.png`,
+                mimeType: "image/png",
+                label: `Screenshot ${index}`,
+            }),
+        );
+        const { onChange, onImageAttachmentValidationFailure } = renderComposer({
+            parts,
+        });
+
+        act(() => {
+            window.dispatchEvent(
+                new CustomEvent(FILE_TREE_NOTE_DRAG_EVENT, {
+                    detail: {
+                        phase: "attach",
+                        x: 0,
+                        y: 0,
+                        notes: [],
+                        files: [
+                            {
+                                filePath: "/vault/assets/extra.png",
+                                fileName: "extra.png",
+                                mimeType: "image/png",
+                            },
+                        ],
+                    },
+                }),
+            );
+        });
+
+        await waitFor(() => {
+            expect(onImageAttachmentValidationFailure).toHaveBeenCalledWith(
+                "too_many",
+            );
+        });
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it("rejects unsupported image files from native file drop", async () => {
+        let dragHandler:
+            | ((event: {
+                  payload: {
+                      type: string;
+                      position?: { x: number; y: number };
+                      paths?: string[];
+                  };
+              }) => void)
+            | null = null;
+        vi.mocked(getCurrentWebview().onDragDropEvent).mockImplementation(
+            async (handler) => {
+                dragHandler = handler as typeof dragHandler;
+                return () => {};
+            },
+        );
+
+        const { onChange, onImageAttachmentValidationFailure } = renderComposer();
+
+        await waitFor(() => {
+            expect(dragHandler).not.toBeNull();
+        });
+
+        act(() => {
+            dragHandler?.({
+                payload: {
+                    type: "drop",
+                    position: { x: 0, y: 0 },
+                    paths: ["/vault/assets/vector.svg"],
+                },
+            });
+        });
+
+        await waitFor(() => {
+            expect(onImageAttachmentValidationFailure).toHaveBeenCalledWith(
+                "unsupported_type",
+            );
+        });
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it("rejects oversized native file drops when the vault entry size is known", async () => {
+        setVaultEntries([
+            buildVaultFileEntry("assets/huge.png", {
+                mimeType: "image/png",
+                size: MAX_IMAGE_ATTACHMENT_BYTES + 1,
+                isImageLike: true,
+            }),
+        ]);
+        let dragHandler:
+            | ((event: {
+                  payload: {
+                      type: string;
+                      position?: { x: number; y: number };
+                      paths?: string[];
+                  };
+              }) => void)
+            | null = null;
+        vi.mocked(getCurrentWebview().onDragDropEvent).mockImplementation(
+            async (handler) => {
+                dragHandler = handler as typeof dragHandler;
+                return () => {};
+            },
+        );
+
+        const { onChange, onImageAttachmentValidationFailure } = renderComposer();
+
+        await waitFor(() => {
+            expect(dragHandler).not.toBeNull();
+        });
+
+        act(() => {
+            dragHandler?.({
+                payload: {
+                    type: "drop",
+                    position: { x: 0, y: 0 },
+                    paths: ["/vault/assets/huge.png"],
+                },
+            });
+        });
+
+        await waitFor(() => {
+            expect(onImageAttachmentValidationFailure).toHaveBeenCalledWith(
+                "too_large",
+            );
+        });
+        expect(onChange).not.toHaveBeenCalled();
     });
 
     it("opens the @ picker when the caret is inside a text node", async () => {

@@ -1336,6 +1336,281 @@ describe("chatStore", () => {
         });
     });
 
+    it("normalizes pasted screenshot parts into file attachments", async () => {
+        await useChatStore.getState().initialize();
+        const activeSessionId = getActiveSessionId();
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    status: "waiting_permission",
+                    attachments: [],
+                },
+            },
+        }));
+        useChatStore.getState().setComposerParts([
+            { id: "text-1", type: "text", text: "Inspect " },
+            {
+                id: "screenshot-1",
+                type: "screenshot",
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+                label: "Screenshot 10:32",
+                createdAt: 123,
+            },
+        ]);
+
+        await useChatStore.getState().sendMessage();
+
+        const queuedMessage =
+            useChatStore.getState().queuedMessagesBySessionId[
+                activeSessionId
+            ]?.[0];
+        expect(queuedMessage?.prompt).toBe("Inspect");
+        expect(queuedMessage?.attachments).toEqual([
+            expect.objectContaining({
+                type: "file",
+                noteId: null,
+                label: "Screenshot 10:32",
+                path: null,
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+            }),
+        ]);
+    });
+
+    it("normalizes image file attachment parts into the same file attachment shape", async () => {
+        await useChatStore.getState().initialize();
+        const activeSessionId = getActiveSessionId();
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    status: "waiting_permission",
+                    attachments: [],
+                },
+            },
+        }));
+        useChatStore.getState().setComposerParts([
+            { id: "text-1", type: "text", text: "Inspect " },
+            {
+                id: "file-1",
+                type: "file_attachment",
+                filePath: "/vault/assets/chat/frame.jpg",
+                mimeType: "image/jpeg",
+                label: "frame.jpg",
+            },
+        ]);
+
+        await useChatStore.getState().sendMessage();
+
+        const queuedMessage =
+            useChatStore.getState().queuedMessagesBySessionId[
+                activeSessionId
+            ]?.[0];
+        expect(queuedMessage?.prompt).toBe("Inspect");
+        expect(queuedMessage?.attachments).toEqual([
+            expect.objectContaining({
+                type: "file",
+                noteId: null,
+                label: "frame.jpg",
+                path: null,
+                filePath: "/vault/assets/chat/frame.jpg",
+                mimeType: "image/jpeg",
+            }),
+        ]);
+    });
+
+    it("allows image-only composer messages without echoing the image path into the prompt", async () => {
+        await useChatStore.getState().initialize();
+        const activeSessionId = getActiveSessionId();
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    status: "waiting_permission",
+                    attachments: [],
+                },
+            },
+        }));
+        useChatStore.getState().setComposerParts([
+            {
+                id: "screenshot-1",
+                type: "screenshot",
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+                label: "Screenshot 10:32",
+                createdAt: 123,
+            },
+        ]);
+
+        await useChatStore.getState().sendMessage();
+
+        const queuedMessage =
+            useChatStore.getState().queuedMessagesBySessionId[
+                activeSessionId
+            ]?.[0];
+        expect(queuedMessage).toMatchObject({
+            content: "[Screenshot 10:32]",
+            prompt: "",
+            attachments: [
+                expect.objectContaining({
+                    filePath: "/vault/assets/chat/screenshot.png",
+                    mimeType: "image/png",
+                }),
+            ],
+        });
+    });
+
+    it("copies pasted screenshot attachments onto the optimistic user message", async () => {
+        await useChatStore.getState().initialize();
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_send_message") {
+                return {
+                    ...sessionPayload,
+                    status: "streaming",
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+        useChatStore.getState().setComposerParts([
+            { id: "text-1", type: "text", text: "Inspect " },
+            {
+                id: "screenshot-1",
+                type: "screenshot",
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+                label: "Screenshot 10:32",
+                createdAt: 123,
+            },
+        ]);
+
+        await useChatStore.getState().sendMessage();
+
+        const activeSessionId = getActiveSessionId();
+        const userMessage =
+            useChatStore.getState().sessionsById[activeSessionId]?.messages[0];
+        expect(userMessage).toMatchObject({
+            role: "user",
+            attachments: [
+                expect.objectContaining({
+                    type: "file",
+                    noteId: null,
+                    label: "Screenshot 10:32",
+                    path: null,
+                    filePath: "/vault/assets/chat/screenshot.png",
+                    mimeType: "image/png",
+                }),
+            ],
+        });
+    });
+
+    it("carries queued screenshot attachments into the sent user message", async () => {
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_send_message") {
+                return {
+                    ...sessionPayload,
+                    status: "streaming",
+                    session_id:
+                        typeof args === "object" &&
+                        args !== null &&
+                        "sessionId" in args &&
+                        typeof args.sessionId === "string"
+                            ? args.sessionId
+                            : sessionPayload.session_id,
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    status: "streaming",
+                    attachments: [],
+                },
+            },
+        }));
+        useChatStore.getState().setComposerParts([
+            { id: "text-1", type: "text", text: "Inspect " },
+            {
+                id: "screenshot-1",
+                type: "screenshot",
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+                label: "Screenshot 10:32",
+                createdAt: 123,
+            },
+        ]);
+
+        await useChatStore.getState().sendMessage();
+
+        const queuedMessage =
+            useChatStore.getState().queuedMessagesBySessionId[
+                activeSessionId
+            ]?.[0];
+        expect(queuedMessage?.prompt).toBe("Inspect");
+        expect(queuedMessage?.attachments).toEqual([
+            expect.objectContaining({
+                type: "file",
+                noteId: null,
+                label: "Screenshot 10:32",
+                path: null,
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+            }),
+        ]);
+
+        useChatStore.getState().applyMessageCompleted({
+            session_id: activeSessionId,
+            message_id: "assistant-1",
+        });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(
+            invokeMock.mock.calls.some(
+                ([command, payload]) =>
+                    command === "ai_send_message" &&
+                    typeof payload === "object" &&
+                    payload !== null &&
+                    "content" in payload &&
+                    payload.content === "Inspect" &&
+                    "attachments" in payload &&
+                    Array.isArray(payload.attachments) &&
+                    payload.attachments.some(
+                        (attachment) =>
+                            attachment.filePath ===
+                                "/vault/assets/chat/screenshot.png" &&
+                            attachment.mimeType === "image/png",
+                    ),
+            ),
+        ).toBe(true);
+        expect(
+            useChatStore
+                .getState()
+                .sessionsById[activeSessionId]?.messages.some(
+                    (message) =>
+                        message.role === "user" &&
+                        message.attachments?.some(
+                            (attachment) =>
+                                attachment.filePath ===
+                                    "/vault/assets/chat/screenshot.png" &&
+                                attachment.mimeType === "image/png",
+                        ),
+                ),
+        ).toBe(true);
+    });
+
     it("does not synthesize legacy auto-context attachments when sending a plain composer message", async () => {
         useVaultStore.setState({
             vaultPath: "/vault",
@@ -2926,6 +3201,18 @@ describe("chatStore", () => {
                             kind: "text",
                             content: "Recovered from disk",
                             timestamp: 10,
+                            attachments: [
+                                {
+                                    id: "attachment-1",
+                                    type: "file",
+                                    noteId: null,
+                                    label: "Screenshot",
+                                    path: null,
+                                    filePath:
+                                        "/vault/assets/chat/screenshot.png",
+                                    mimeType: "image/png",
+                                },
+                            ],
                         },
                         {
                             id: "m2",
@@ -2967,6 +3254,13 @@ describe("chatStore", () => {
         expect(sessionAfter.messages.map((message) => message.id)).toEqual([
             "m1",
             "m2",
+        ]);
+        expect(sessionAfter.messages[0]?.attachments).toEqual([
+            expect.objectContaining({
+                type: "file",
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+            }),
         ]);
     });
 
@@ -6835,6 +7129,83 @@ describe("chatStore", () => {
                     activeSessionId
                 ]?.messages.some((message) => message.role === "user" && message.content === "Second updated"),
         ).toBe(true);
+    });
+
+    it("does not duplicate image attachments when saving an edited queued screenshot message", async () => {
+        let sentAttachments: AIChatAttachment[] | null = null;
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_send_message") {
+                sentAttachments =
+                    typeof args === "object" &&
+                    args !== null &&
+                    "attachments" in args &&
+                    Array.isArray(args.attachments)
+                        ? (args.attachments as AIChatAttachment[])
+                        : null;
+                return {
+                    ...sessionPayload,
+                    status: "streaming" as const,
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+        const screenshotPart: AIComposerPart = {
+            id: "screenshot-1",
+            type: "screenshot",
+            filePath: "/vault/assets/chat/screenshot.png",
+            mimeType: "image/png",
+            label: "Screenshot 10:32",
+            createdAt: 123,
+        };
+        const queuedAttachment: AIChatAttachment = {
+            id: "queued-image",
+            type: "file",
+            noteId: null,
+            label: "Screenshot 10:32",
+            path: null,
+            filePath: "/vault/assets/chat/screenshot.png",
+            mimeType: "image/png",
+            status: "ready",
+        };
+
+        useChatStore
+            .getState()
+            .enqueueMessage(
+                activeSessionId,
+                createQueuedMessage("queued-image", "Inspect this", {
+                    content: "Inspect this [Screenshot 10:32]",
+                    prompt: "Inspect this",
+                    composerParts: [
+                        { id: "text-1", type: "text", text: "Inspect this " },
+                        screenshotPart,
+                    ],
+                    attachments: [queuedAttachment],
+                }),
+            );
+
+        useChatStore
+            .getState()
+            .editQueuedMessage(activeSessionId, "queued-image");
+        useChatStore.getState().setComposerParts([
+            { id: "text-2", type: "text", text: "Inspect this again " },
+            screenshotPart,
+        ]);
+
+        await useChatStore.getState().sendMessage();
+
+        expect(
+            sentAttachments?.filter(
+                (attachment) =>
+                    attachment.filePath ===
+                        "/vault/assets/chat/screenshot.png" &&
+                    attachment.mimeType === "image/png",
+            ),
+        ).toHaveLength(1);
     });
 
     it("drops stale queued copies of an edited message when sending it immediately", async () => {
@@ -13768,6 +14139,81 @@ describe("chatStore", () => {
         expect(historyPayload?.history).not.toHaveProperty(
             "visibleWorkCycleId",
         );
+    });
+
+    it("persists user message attachments in session history", async () => {
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    messages: [
+                        {
+                            id: "user-with-screenshot",
+                            role: "user",
+                            kind: "text",
+                            content: "Inspect this screenshot",
+                            timestamp: 10,
+                            attachments: [
+                                {
+                                    id: "attachment-1",
+                                    type: "file",
+                                    noteId: null,
+                                    label: "Screenshot",
+                                    path: null,
+                                    filePath:
+                                        "/vault/assets/chat/screenshot.png",
+                                    mimeType: "image/png",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            },
+        }));
+
+        useChatStore.getState().applySessionError({
+            session_id: activeSessionId,
+            message: "Trigger persistence",
+        });
+        await Promise.resolve();
+
+        const historyCall = invokeMock.mock.calls.find(
+            ([command]) => command === "ai_save_session_history",
+        );
+        expect(historyCall).toBeTruthy();
+
+        const historyPayload =
+            typeof historyCall?.[1] === "object" && historyCall[1] !== null
+                ? (historyCall[1] as {
+                      history?: {
+                          messages?: Array<{
+                              id?: string;
+                              attachments?: AIChatAttachment[];
+                          }>;
+                      };
+                  })
+                : null;
+
+        expect(
+            historyPayload?.history?.messages?.find(
+                (message) => message.id === "user-with-screenshot",
+            )?.attachments,
+        ).toEqual([
+            expect.objectContaining({
+                type: "file",
+                filePath: "/vault/assets/chat/screenshot.png",
+                mimeType: "image/png",
+            }),
+        ]);
     });
 
     it("coalesces repeated history persistence requests in the same microtask", async () => {

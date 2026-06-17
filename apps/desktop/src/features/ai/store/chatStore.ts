@@ -2559,6 +2559,13 @@ function cloneAttachment(attachment: AIChatAttachment): AIChatAttachment {
     return { ...attachment };
 }
 
+function cloneMessageAttachments(
+    attachments?: AIChatAttachment[] | null,
+): AIChatAttachment[] | undefined {
+    if (!attachments?.length) return undefined;
+    return attachments.map(cloneAttachment);
+}
+
 function cloneComposerPart(part: AIComposerPart): AIComposerPart {
     return { ...part };
 }
@@ -2567,8 +2574,74 @@ function cloneComposerParts(parts: AIComposerPart[]): AIComposerPart[] {
     return parts.map(cloneComposerPart);
 }
 
+type ComposerFileBackedPart = Extract<
+    AIComposerPart,
+    { type: "screenshot" } | { type: "file_attachment" }
+>;
+
+function composerFilePartToAttachment(
+    part: ComposerFileBackedPart,
+): AIChatAttachment {
+    return {
+        id: crypto.randomUUID(),
+        type: "file",
+        noteId: null,
+        label: part.label,
+        path: null,
+        filePath: part.filePath,
+        mimeType: part.mimeType,
+    };
+}
+
 function normalizeComparablePath(path: string) {
     return normalizeVaultPath(path).replace(/\/+$/, "");
+}
+
+function isComposerOwnedQueuedAttachment(
+    attachment: AIChatAttachment,
+    composerParts: AIComposerPart[],
+) {
+    if (attachment.type === "selection") {
+        if (!attachment.path) return false;
+        const attachmentPath = normalizeComparablePath(attachment.path);
+        return composerParts.some(
+            (part) =>
+                part.type === "selection_mention" &&
+                normalizeComparablePath(part.path) === attachmentPath &&
+                part.startLine === attachment.startLine &&
+                part.endLine === attachment.endLine,
+        );
+    }
+
+    if (attachment.type !== "file" || attachment.path || !attachment.filePath) {
+        return false;
+    }
+
+    const attachmentPath = normalizeComparablePath(attachment.filePath);
+    return composerParts.some(
+        (part) =>
+            (part.type === "screenshot" ||
+                part.type === "file_attachment") &&
+            normalizeComparablePath(part.filePath) === attachmentPath &&
+            (!attachment.mimeType || part.mimeType === attachment.mimeType),
+    );
+}
+
+function getQueuedMessageContextAttachments(
+    queuedItem: QueuedChatMessage,
+): AIChatAttachment[] {
+    // Queue items store the final send payload. When reopening one for editing,
+    // keep only session-level context here; composer-owned attachments are
+    // reconstructed from composerParts on save.
+    return queuedItem.attachments
+        .filter(
+            (attachment) =>
+                !isComposerOwnedQueuedAttachment(
+                    attachment,
+                    queuedItem.composerParts,
+                ),
+        )
+        .map(cloneAttachment);
 }
 
 function isPathInsideRoot(path: string, root: string) {
@@ -2848,9 +2921,6 @@ function buildQueuedMessage(
     const prompt = serializeComposerPartsForAI(composerPartsSnapshot, {
         vaultPath: useVaultStore.getState().vaultPath,
     }).trim();
-    if (!content || !prompt) {
-        return null;
-    }
 
     const selectionAttachments: AIChatAttachment[] = composerPartsSnapshot
         .filter(
@@ -2873,30 +2943,14 @@ function buildQueuedMessage(
             (p): p is Extract<AIComposerPart, { type: "screenshot" }> =>
                 p.type === "screenshot",
         )
-        .map((p) => ({
-            id: crypto.randomUUID(),
-            type: "file" as const,
-            noteId: null,
-            label: p.label,
-            path: null,
-            filePath: p.filePath,
-            mimeType: p.mimeType,
-        }));
+        .map(composerFilePartToAttachment);
 
     const fileAttachments: AIChatAttachment[] = composerPartsSnapshot
         .filter(
             (p): p is Extract<AIComposerPart, { type: "file_attachment" }> =>
                 p.type === "file_attachment",
         )
-        .map((p) => ({
-            id: crypto.randomUUID(),
-            type: "file" as const,
-            noteId: null,
-            label: p.label,
-            path: null,
-            filePath: p.filePath,
-            mimeType: p.mimeType,
-        }));
+        .map(composerFilePartToAttachment);
 
     const attachments = [
         ...session.attachments,
@@ -2904,6 +2958,10 @@ function buildQueuedMessage(
         ...screenshotAttachments,
         ...fileAttachments,
     ].map(cloneAttachment);
+
+    if (!content || (!prompt && attachments.length === 0)) {
+        return null;
+    }
 
     return {
         id: crypto.randomUUID(),
@@ -5987,6 +6045,7 @@ function toPersistedHistory(session: AIChatSession): PersistedSessionHistory {
             kind: m.kind,
             content: m.content,
             timestamp: m.timestamp,
+            attachments: cloneMessageAttachments(m.attachments),
             title: m.title,
             meta: m.meta,
             permission_request_id: m.permissionRequestId,
@@ -6678,6 +6737,7 @@ function restoreMessagesFromHistory(
                 kind: m.kind as AIChatMessageKind,
                 content: m.content,
                 timestamp: m.timestamp,
+                attachments: cloneMessageAttachments(m.attachments),
                 title: m.title,
                 meta: m.meta,
                 permissionRequestId: m.permission_request_id,
@@ -7346,6 +7406,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     ...createTextMessage("user", currentItem.content),
                     id: userMessageId,
                     workCycleId: nextSession.activeWorkCycleId,
+                    attachments: cloneMessageAttachments(currentItem.attachments),
                 };
 
                 return {
@@ -10403,7 +10464,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         [sessionId]: {
                             ...session,
                             attachments:
-                                queuedItem.attachments.map(cloneAttachment),
+                                getQueuedMessageContextAttachments(queuedItem),
                         },
                     },
                     composerPartsBySessionId: {
