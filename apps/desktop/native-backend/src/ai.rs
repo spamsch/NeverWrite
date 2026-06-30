@@ -878,6 +878,28 @@ struct AcpPromptCapabilities {
     embedded_context: bool,
 }
 
+#[derive(Clone)]
+struct AcpActorSharedState {
+    event_tx: Sender<RpcOutput>,
+    session_state: Arc<Mutex<NativeAiInner>>,
+    tool_diffs: ToolDiffState,
+    agent_writes: AgentWriteTracker,
+}
+
+#[derive(Clone)]
+struct AcpElicitationState {
+    user_input_waiters: Arc<Mutex<HashMap<String, ElicitationWaiter>>>,
+    url_elicitation_waiters: Arc<Mutex<HashMap<String, UrlElicitationWaiter>>>,
+    completed_url_elicitations: Arc<Mutex<VecDeque<String>>>,
+}
+
+#[derive(Clone)]
+struct AcpActorContext {
+    shared: AcpActorSharedState,
+    elicitations: AcpElicitationState,
+    prompt_capabilities: Arc<Mutex<AcpPromptCapabilities>>,
+}
+
 struct ElicitationWaiter {
     session_id: String,
     fields: HashMap<String, ElicitationFieldSpec>,
@@ -944,6 +966,25 @@ struct AuthTerminalLaunchConfig {
     env: HashMap<String, String>,
     runtime_id: String,
     method_id: String,
+}
+
+#[derive(Clone)]
+struct AuthTerminalContext {
+    snapshot: Arc<Mutex<AiAuthTerminalSessionSnapshot>>,
+    closed: Arc<AtomicBool>,
+    session_state: Arc<Mutex<NativeAiInner>>,
+    setup_store: RuntimeSetupStore,
+    runtime_id: String,
+    method_id: String,
+    event_tx: Sender<RpcOutput>,
+}
+
+#[derive(Clone)]
+struct AuthTerminalProcessHandles {
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    child: Arc<Mutex<Option<Box<dyn PtyChild + Send + Sync>>>>,
+    killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
 }
 
 struct AuthTerminalHandle {
@@ -1059,6 +1100,23 @@ impl NativeAi {
             completed_url_elicitations: Arc::new(Mutex::new(VecDeque::new())),
             auth_terminal_sessions: Arc::new(Mutex::new(HashMap::new())),
             auth_terminal_counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn acp_actor_context(&self) -> AcpActorContext {
+        AcpActorContext {
+            shared: AcpActorSharedState {
+                event_tx: self.event_tx.clone(),
+                session_state: Arc::clone(&self.inner),
+                tool_diffs: self.tool_diffs.clone(),
+                agent_writes: self.agent_writes.clone(),
+            },
+            elicitations: AcpElicitationState {
+                user_input_waiters: Arc::clone(&self.user_input_waiters),
+                url_elicitation_waiters: Arc::clone(&self.url_elicitation_waiters),
+                completed_url_elicitations: Arc::clone(&self.completed_url_elicitations),
+            },
+            prompt_capabilities: Arc::new(Mutex::new(AcpPromptCapabilities::default())),
         }
     }
 
@@ -1350,13 +1408,7 @@ impl NativeAi {
             AcpSessionStartMode::New {
                 additional_directories: normalized.kept.clone(),
             },
-            self.event_tx.clone(),
-            Arc::clone(&self.inner),
-            self.tool_diffs.clone(),
-            self.agent_writes.clone(),
-            Arc::clone(&self.user_input_waiters),
-            Arc::clone(&self.url_elicitation_waiters),
-            Arc::clone(&self.completed_url_elicitations),
+            self.acp_actor_context(),
         ) {
             Ok(created) => created,
             Err(error) => {
@@ -1463,13 +1515,7 @@ impl NativeAi {
                 session_id: input.session_id,
                 additional_directories: normalized.kept.clone(),
             },
-            self.event_tx.clone(),
-            Arc::clone(&self.inner),
-            self.tool_diffs.clone(),
-            self.agent_writes.clone(),
-            Arc::clone(&self.user_input_waiters),
-            Arc::clone(&self.url_elicitation_waiters),
-            Arc::clone(&self.completed_url_elicitations),
+            self.acp_actor_context(),
         ) {
             Ok(created) => created,
             Err(error) => {
@@ -2127,29 +2173,24 @@ impl NativeAi {
             closed: Arc::new(AtomicBool::new(false)),
         };
 
-        spawn_auth_terminal_output_reader(
-            reader,
-            Arc::clone(&handle.snapshot),
-            Arc::clone(&handle.closed),
-            Arc::clone(&self.inner),
-            self.setup_store.clone(),
-            launch_config.runtime_id.clone(),
-            launch_config.method_id.clone(),
-            self.event_tx.clone(),
-        );
-        spawn_auth_terminal_exit_monitor(
-            Arc::clone(&handle.master),
-            Arc::clone(&handle.writer),
-            Arc::clone(&handle.child),
-            Arc::clone(&handle.killer),
-            Arc::clone(&handle.snapshot),
-            Arc::clone(&handle.closed),
-            Arc::clone(&self.inner),
-            self.setup_store.clone(),
-            launch_config.runtime_id.clone(),
-            launch_config.method_id.clone(),
-            self.event_tx.clone(),
-        );
+        let terminal_context = AuthTerminalContext {
+            snapshot: Arc::clone(&handle.snapshot),
+            closed: Arc::clone(&handle.closed),
+            session_state: Arc::clone(&self.inner),
+            setup_store: self.setup_store.clone(),
+            runtime_id: launch_config.runtime_id.clone(),
+            method_id: launch_config.method_id.clone(),
+            event_tx: self.event_tx.clone(),
+        };
+        let process_handles = AuthTerminalProcessHandles {
+            master: Arc::clone(&handle.master),
+            writer: Arc::clone(&handle.writer),
+            child: Arc::clone(&handle.child),
+            killer: Arc::clone(&handle.killer),
+        };
+
+        spawn_auth_terminal_output_reader(reader, terminal_context.clone());
+        spawn_auth_terminal_exit_monitor(process_handles, terminal_context);
 
         let created_snapshot = handle.snapshot()?;
         emit_auth_terminal_started(&self.event_tx, &created_snapshot);
@@ -3628,21 +3669,14 @@ fn neverwrite_acp12_client_capabilities(_runtime_id: &str) -> acp12::schema::Cli
 fn start_acp_session(
     spec: AcpProcessSpec,
     start_mode: AcpSessionStartMode,
-    event_tx: Sender<RpcOutput>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    tool_diffs: ToolDiffState,
-    agent_writes: AgentWriteTracker,
-    user_input_waiters: Arc<Mutex<HashMap<String, ElicitationWaiter>>>,
-    url_elicitation_waiters: Arc<Mutex<HashMap<String, UrlElicitationWaiter>>>,
-    completed_url_elicitations: Arc<Mutex<VecDeque<String>>>,
+    context: AcpActorContext,
 ) -> Result<CreatedAcpSession, String> {
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<AcpCommand>();
     let (created_tx, created_rx) = mpsc::channel();
     let flavor = acp_protocol_flavor(&spec.runtime_id);
-    let prompt_capabilities = Arc::new(Mutex::new(AcpPromptCapabilities::default()));
     let handle = AcpSessionHandle {
         command_tx: command_tx.clone(),
-        prompt_capabilities: Arc::clone(&prompt_capabilities),
+        prompt_capabilities: Arc::clone(&context.prompt_capabilities),
     };
     thread::spawn(move || {
         let runtime = match Builder::new_current_thread().enable_all().build() {
@@ -3655,38 +3689,10 @@ fn start_acp_session(
         runtime.block_on(async move {
             match flavor {
                 AcpProtocolFlavor::Current14 => {
-                    run_acp_actor(
-                        spec,
-                        start_mode,
-                        event_tx,
-                        session_state,
-                        tool_diffs,
-                        agent_writes,
-                        user_input_waiters,
-                        url_elicitation_waiters,
-                        completed_url_elicitations,
-                        prompt_capabilities,
-                        command_rx,
-                        created_tx,
-                    )
-                    .await;
+                    run_acp_actor(spec, start_mode, context, command_rx, created_tx).await;
                 }
                 AcpProtocolFlavor::Legacy12 => {
-                    run_acp12_actor(
-                        spec,
-                        start_mode,
-                        event_tx,
-                        session_state,
-                        tool_diffs,
-                        agent_writes,
-                        user_input_waiters,
-                        url_elicitation_waiters,
-                        completed_url_elicitations,
-                        prompt_capabilities,
-                        command_rx,
-                        created_tx,
-                    )
-                    .await;
+                    run_acp12_actor(spec, start_mode, context, command_rx, created_tx).await;
                 }
             }
         });
@@ -4029,28 +4035,14 @@ async fn run_acp12_auth_inner(
 async fn run_acp_actor(
     spec: AcpProcessSpec,
     start_mode: AcpSessionStartMode,
-    event_tx: Sender<RpcOutput>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    tool_diffs: ToolDiffState,
-    agent_writes: AgentWriteTracker,
-    user_input_waiters: Arc<Mutex<HashMap<String, ElicitationWaiter>>>,
-    url_elicitation_waiters: Arc<Mutex<HashMap<String, UrlElicitationWaiter>>>,
-    completed_url_elicitations: Arc<Mutex<VecDeque<String>>>,
-    prompt_capabilities: Arc<Mutex<AcpPromptCapabilities>>,
+    context: AcpActorContext,
     mut command_rx: tokio::sync::mpsc::UnboundedReceiver<AcpCommand>,
     created_tx: mpsc::Sender<Result<AiSession, String>>,
 ) {
     let result = run_acp_actor_inner(
         spec,
         start_mode,
-        event_tx,
-        session_state,
-        tool_diffs,
-        agent_writes,
-        user_input_waiters,
-        url_elicitation_waiters,
-        completed_url_elicitations,
-        prompt_capabilities,
+        context,
         &mut command_rx,
         created_tx.clone(),
     )
@@ -4063,28 +4055,14 @@ async fn run_acp_actor(
 async fn run_acp12_actor(
     spec: AcpProcessSpec,
     start_mode: AcpSessionStartMode,
-    event_tx: Sender<RpcOutput>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    tool_diffs: ToolDiffState,
-    agent_writes: AgentWriteTracker,
-    user_input_waiters: Arc<Mutex<HashMap<String, ElicitationWaiter>>>,
-    url_elicitation_waiters: Arc<Mutex<HashMap<String, UrlElicitationWaiter>>>,
-    completed_url_elicitations: Arc<Mutex<VecDeque<String>>>,
-    prompt_capabilities: Arc<Mutex<AcpPromptCapabilities>>,
+    context: AcpActorContext,
     mut command_rx: tokio::sync::mpsc::UnboundedReceiver<AcpCommand>,
     created_tx: mpsc::Sender<Result<AiSession, String>>,
 ) {
     let result = run_acp12_actor_inner(
         spec,
         start_mode,
-        event_tx,
-        session_state,
-        tool_diffs,
-        agent_writes,
-        user_input_waiters,
-        url_elicitation_waiters,
-        completed_url_elicitations,
-        prompt_capabilities,
+        context,
         &mut command_rx,
         created_tx.clone(),
     )
@@ -4097,14 +4075,7 @@ async fn run_acp12_actor(
 async fn run_acp12_actor_inner(
     spec: AcpProcessSpec,
     start_mode: AcpSessionStartMode,
-    event_tx: Sender<RpcOutput>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    tool_diffs: ToolDiffState,
-    agent_writes: AgentWriteTracker,
-    user_input_waiters: Arc<Mutex<HashMap<String, ElicitationWaiter>>>,
-    url_elicitation_waiters: Arc<Mutex<HashMap<String, UrlElicitationWaiter>>>,
-    completed_url_elicitations: Arc<Mutex<VecDeque<String>>>,
-    prompt_capabilities: Arc<Mutex<AcpPromptCapabilities>>,
+    context: AcpActorContext,
     command_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AcpCommand>,
     created_tx: mpsc::Sender<Result<AiSession, String>>,
 ) -> Result<(), String> {
@@ -4130,18 +4101,19 @@ async fn run_acp12_actor_inner(
         .stdout
         .take()
         .ok_or_else(|| "Failed to acquire ACP stdout".to_string())?;
+    let event_tx = context.shared.event_tx.clone();
     let client = NativeAcpClient {
         event_tx: event_tx.clone(),
-        session_state,
+        session_state: Arc::clone(&context.shared.session_state),
         message_ids: Arc::new(Mutex::new(HashMap::new())),
         thinking_ids: Arc::new(Mutex::new(HashMap::new())),
         permission_waiters: Arc::new(Mutex::new(HashMap::new())),
-        user_input_waiters,
-        url_elicitation_waiters,
-        completed_url_elicitations,
+        user_input_waiters: Arc::clone(&context.elicitations.user_input_waiters),
+        url_elicitation_waiters: Arc::clone(&context.elicitations.url_elicitation_waiters),
+        completed_url_elicitations: Arc::clone(&context.elicitations.completed_url_elicitations),
         suppressed_status_tool_calls: Arc::new(Mutex::new(HashSet::new())),
-        tool_diffs,
-        agent_writes,
+        tool_diffs: context.shared.tool_diffs.clone(),
+        agent_writes: context.shared.agent_writes.clone(),
         terminal_output: Arc::new(Mutex::new(HashMap::new())),
         terminal_exit: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -4151,6 +4123,7 @@ async fn run_acp12_actor_inner(
     let session_created_for_connection = Arc::clone(&session_created);
     let disconnect_runtime_id = spec.runtime_id.clone();
     let event_tx_for_connection = event_tx.clone();
+    let prompt_capabilities = Arc::clone(&context.prompt_capabilities);
     let client_for_shutdown = client.clone();
 
     let result = acp12::Client
@@ -4299,14 +4272,7 @@ async fn run_acp12_actor_inner(
 async fn run_acp_actor_inner(
     spec: AcpProcessSpec,
     start_mode: AcpSessionStartMode,
-    event_tx: Sender<RpcOutput>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    tool_diffs: ToolDiffState,
-    agent_writes: AgentWriteTracker,
-    user_input_waiters: Arc<Mutex<HashMap<String, ElicitationWaiter>>>,
-    url_elicitation_waiters: Arc<Mutex<HashMap<String, UrlElicitationWaiter>>>,
-    completed_url_elicitations: Arc<Mutex<VecDeque<String>>>,
-    prompt_capabilities: Arc<Mutex<AcpPromptCapabilities>>,
+    context: AcpActorContext,
     command_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AcpCommand>,
     created_tx: mpsc::Sender<Result<AiSession, String>>,
 ) -> Result<(), String> {
@@ -4332,18 +4298,19 @@ async fn run_acp_actor_inner(
         .stdout
         .take()
         .ok_or_else(|| "Failed to acquire ACP stdout".to_string())?;
+    let event_tx = context.shared.event_tx.clone();
     let client = NativeAcpClient {
         event_tx: event_tx.clone(),
-        session_state,
+        session_state: Arc::clone(&context.shared.session_state),
         message_ids: Arc::new(Mutex::new(HashMap::new())),
         thinking_ids: Arc::new(Mutex::new(HashMap::new())),
         permission_waiters: Arc::new(Mutex::new(HashMap::new())),
-        user_input_waiters,
-        url_elicitation_waiters,
-        completed_url_elicitations,
+        user_input_waiters: Arc::clone(&context.elicitations.user_input_waiters),
+        url_elicitation_waiters: Arc::clone(&context.elicitations.url_elicitation_waiters),
+        completed_url_elicitations: Arc::clone(&context.elicitations.completed_url_elicitations),
         suppressed_status_tool_calls: Arc::new(Mutex::new(HashSet::new())),
-        tool_diffs,
-        agent_writes,
+        tool_diffs: context.shared.tool_diffs.clone(),
+        agent_writes: context.shared.agent_writes.clone(),
         terminal_output: Arc::new(Mutex::new(HashMap::new())),
         terminal_exit: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -4353,6 +4320,7 @@ async fn run_acp_actor_inner(
     let session_created_for_connection = Arc::clone(&session_created);
     let disconnect_runtime_id = spec.runtime_id.clone();
     let event_tx_for_connection = event_tx.clone();
+    let prompt_capabilities = Arc::clone(&context.prompt_capabilities);
     let client_for_shutdown = client.clone();
 
     let result = Client
@@ -7684,10 +7652,10 @@ fn should_run_acp_logout(runtime_id: &str, setup: &RuntimeSetupState) -> bool {
     match (runtime_id, setup.auth_method.as_deref()) {
         (CODEX_RUNTIME_ID, Some("chatgpt")) => true,
         (CLAUDE_RUNTIME_ID, Some("claude-ai-login" | "claude-login")) => true,
-        (CLAUDE_RUNTIME_ID, Some("console-login")) => !setup
+        (CLAUDE_RUNTIME_ID, Some("console-login")) => setup
             .env
             .get("ANTHROPIC_AUTH_TOKEN")
-            .is_some_and(|value| !value.trim().is_empty()),
+            .is_none_or(|value| value.trim().is_empty()),
         _ => false,
     }
 }
@@ -8329,10 +8297,12 @@ fn build_prompt_blocks_with_attachments(
                         &mut text_context_parts,
                         attachment,
                         file_path,
-                        vault_root,
-                        additional_roots,
-                        capabilities,
-                        &image_limits,
+                        FileAttachmentBuildContext {
+                            vault_root,
+                            additional_roots,
+                            capabilities,
+                            image_limits: &image_limits,
+                        },
                     )?;
                 }
             }
@@ -8407,6 +8377,13 @@ struct NativeImageAttachmentLimits {
     max_bytes: u64,
     max_images_per_message: usize,
     allowed_mime_types: &'static [&'static str],
+}
+
+struct FileAttachmentBuildContext<'a> {
+    vault_root: Option<&'a Path>,
+    additional_roots: &'a [PathBuf],
+    capabilities: AcpPromptCapabilities,
+    image_limits: &'a NativeImageAttachmentLimits,
 }
 
 const DEFAULT_NATIVE_IMAGE_MIME_TYPES: &[&str] =
@@ -8503,17 +8480,14 @@ fn append_file_attachment_blocks(
     text_context_parts: &mut Vec<String>,
     attachment: &AiAttachmentInput,
     file_path: &str,
-    vault_root: Option<&Path>,
-    additional_roots: &[PathBuf],
-    capabilities: AcpPromptCapabilities,
-    image_limits: &NativeImageAttachmentLimits,
+    context: FileAttachmentBuildContext<'_>,
 ) -> Result<(), String> {
-    let path = allowed_attachment_path(file_path, vault_root, additional_roots)?;
+    let path = allowed_attachment_path(file_path, context.vault_root, context.additional_roots)?;
     let mime = attachment
         .mime_type
         .as_deref()
         .unwrap_or("application/octet-stream");
-    let rel_path = display_attachment_path(&path, vault_root);
+    let rel_path = display_attachment_path(&path, context.vault_root);
 
     if mime == "application/pdf" {
         text_context_parts.push(format!(
@@ -8521,7 +8495,7 @@ fn append_file_attachment_blocks(
             attachment.label, rel_path
         ));
     } else if mime.starts_with("text/") || mime == "application/json" {
-        if capabilities.embedded_context {
+        if context.capabilities.embedded_context {
             match std::fs::read_to_string(&path) {
                 Ok(text) => blocks.push(embedded_text_resource_block(
                     &text,
@@ -8547,11 +8521,11 @@ fn append_file_attachment_blocks(
         }
     } else if mime.starts_with("image/") {
         let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        if capabilities.image {
-            if size > image_limits.max_bytes {
+        if context.capabilities.image {
+            if size > context.image_limits.max_bytes {
                 return Err(format!(
                     "Image attachment is too large for {}: {} exceeds the {} byte limit.",
-                    image_limits.runtime_label, rel_path, image_limits.max_bytes
+                    context.image_limits.runtime_label, rel_path, context.image_limits.max_bytes
                 ));
             }
             match std::fs::read(&path) {
@@ -8977,42 +8951,36 @@ fn release_auth_terminal_runtime_resources(
 
 fn spawn_auth_terminal_output_reader(
     mut reader: Box<dyn Read + Send>,
-    snapshot: Arc<Mutex<AiAuthTerminalSessionSnapshot>>,
-    closed: Arc<AtomicBool>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    setup_store: RuntimeSetupStore,
-    runtime_id: String,
-    method_id: String,
-    event_tx: Sender<RpcOutput>,
+    context: AuthTerminalContext,
 ) {
     thread::spawn(move || {
         let mut buffer = [0_u8; AUTH_TERMINAL_OUTPUT_CHUNK_SIZE];
         let mut verified_auth = false;
         loop {
-            if closed.load(Ordering::Relaxed) {
+            if context.closed.load(Ordering::Relaxed) {
                 break;
             }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    if closed.load(Ordering::Relaxed) {
+                    if context.closed.load(Ordering::Relaxed) {
                         break;
                     }
                     let chunk = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                    let session_id = match snapshot.lock() {
+                    let session_id = match context.snapshot.lock() {
                         Ok(mut snapshot) => {
                             append_auth_terminal_buffer(&mut snapshot.buffer, &chunk);
                             if !verified_auth
                                 && auth_terminal_output_indicates_success(
-                                    &runtime_id,
+                                    &context.runtime_id,
                                     &snapshot.buffer,
                                 )
                             {
                                 mark_runtime_auth_verified(
-                                    &session_state,
-                                    Some(&setup_store),
-                                    &runtime_id,
-                                    &method_id,
+                                    &context.session_state,
+                                    Some(&context.setup_store),
+                                    &context.runtime_id,
+                                    &context.method_id,
                                 );
                                 verified_auth = true;
                             }
@@ -9020,11 +8988,11 @@ fn spawn_auth_terminal_output_reader(
                         }
                         Err(_) => break,
                     };
-                    emit_auth_terminal_output(&event_tx, &session_id, chunk);
+                    emit_auth_terminal_output(&context.event_tx, &session_id, chunk);
                 }
                 Err(error) => {
-                    if !closed.load(Ordering::Relaxed) {
-                        let (session_id, message) = match snapshot.lock() {
+                    if !context.closed.load(Ordering::Relaxed) {
+                        let (session_id, message) = match context.snapshot.lock() {
                             Ok(mut snapshot) => {
                                 snapshot.status = AiAuthTerminalStatus::Error;
                                 snapshot.error_message =
@@ -9036,7 +9004,7 @@ fn spawn_auth_terminal_output_reader(
                             }
                             Err(_) => break,
                         };
-                        emit_auth_terminal_error(&event_tx, &session_id, message);
+                        emit_auth_terminal_error(&context.event_tx, &session_id, message);
                     }
                     break;
                 }
@@ -9080,25 +9048,16 @@ fn acp_process_launch_cwd(_runtime_id: &str, cwd: &Path) -> PathBuf {
 }
 
 fn spawn_auth_terminal_exit_monitor(
-    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
-    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    child: Arc<Mutex<Option<Box<dyn PtyChild + Send + Sync>>>>,
-    killer: Arc<Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>>,
-    snapshot: Arc<Mutex<AiAuthTerminalSessionSnapshot>>,
-    closed: Arc<AtomicBool>,
-    session_state: Arc<Mutex<NativeAiInner>>,
-    setup_store: RuntimeSetupStore,
-    runtime_id: String,
-    method_id: String,
-    event_tx: Sender<RpcOutput>,
+    handles: AuthTerminalProcessHandles,
+    context: AuthTerminalContext,
 ) {
     thread::spawn(move || loop {
-        if closed.load(Ordering::Relaxed) {
+        if context.closed.load(Ordering::Relaxed) {
             break;
         }
 
         let exit_status = {
-            let mut child_guard = match child.lock() {
+            let mut child_guard = match handles.child.lock() {
                 Ok(child_guard) => child_guard,
                 Err(_) => break,
             };
@@ -9110,7 +9069,7 @@ fn spawn_auth_terminal_exit_monitor(
                 Ok(status) => status,
                 Err(error) => {
                     let (session_id, message) = {
-                        let mut snapshot_guard = match snapshot.lock() {
+                        let mut snapshot_guard = match context.snapshot.lock() {
                             Ok(snapshot_guard) => snapshot_guard,
                             Err(_) => break,
                         };
@@ -9126,9 +9085,13 @@ fn spawn_auth_terminal_exit_monitor(
                         )
                     };
                     release_auth_terminal_runtime_resources(
-                        &master, &writer, &child, &killer, false,
+                        &handles.master,
+                        &handles.writer,
+                        &handles.child,
+                        &handles.killer,
+                        false,
                     );
-                    emit_auth_terminal_error(&event_tx, &session_id, message);
+                    emit_auth_terminal_error(&context.event_tx, &session_id, message);
                     break;
                 }
             }
@@ -9138,14 +9101,14 @@ fn spawn_auth_terminal_exit_monitor(
             let exit_code = i32::try_from(exit_status.exit_code()).ok();
             if exit_code == Some(0) {
                 mark_runtime_auth_verified(
-                    &session_state,
-                    Some(&setup_store),
-                    &runtime_id,
-                    &method_id,
+                    &context.session_state,
+                    Some(&context.setup_store),
+                    &context.runtime_id,
+                    &context.method_id,
                 );
             }
             let snapshot = {
-                let mut snapshot_guard = match snapshot.lock() {
+                let mut snapshot_guard = match context.snapshot.lock() {
                     Ok(snapshot_guard) => snapshot_guard,
                     Err(_) => break,
                 };
@@ -9154,8 +9117,14 @@ fn spawn_auth_terminal_exit_monitor(
                 snapshot_guard.error_message = None;
                 snapshot_guard.clone()
             };
-            release_auth_terminal_runtime_resources(&master, &writer, &child, &killer, false);
-            emit_auth_terminal_exited(&event_tx, &snapshot);
+            release_auth_terminal_runtime_resources(
+                &handles.master,
+                &handles.writer,
+                &handles.child,
+                &handles.killer,
+                false,
+            );
+            emit_auth_terminal_exited(&context.event_tx, &snapshot);
             break;
         }
 
