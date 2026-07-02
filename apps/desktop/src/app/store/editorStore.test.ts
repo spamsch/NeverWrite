@@ -85,12 +85,14 @@ function makePdfTab(overrides: {
     path: string;
     page?: number;
     zoom?: number;
+    fitWidth?: boolean;
     viewMode?: "single" | "continuous";
     scrollTop?: number;
     scrollLeft?: number;
 }) {
     const page = overrides.page ?? 1;
     const zoom = overrides.zoom ?? 1;
+    const fitWidth = overrides.fitWidth ?? false;
     const viewMode = overrides.viewMode ?? "continuous";
     const scrollTop = overrides.scrollTop ?? 0;
     const scrollLeft = overrides.scrollLeft ?? 0;
@@ -100,6 +102,7 @@ function makePdfTab(overrides: {
         kind: "pdf" as const,
         page,
         zoom,
+        fitWidth,
         viewMode,
         scrollTop,
         scrollLeft,
@@ -111,6 +114,7 @@ function makePdfTab(overrides: {
                 path: overrides.path,
                 page,
                 zoom,
+                fitWidth,
                 viewMode,
                 scrollTop,
                 scrollLeft,
@@ -902,6 +906,43 @@ describe("editorStore hydration and external insertion", () => {
         });
     });
 
+    it("hydrates pdf fit-width from the current history entry when the tab lacks the field", () => {
+        useEditorStore.getState().hydrateTabs(
+            [
+                {
+                    id: "pdf-fit",
+                    kind: "pdf",
+                    entryId: "docs/wide",
+                    title: "wide.pdf",
+                    path: "/vault/docs/wide.pdf",
+                    history: [
+                        {
+                            kind: "pdf",
+                            entryId: "docs/wide",
+                            title: "wide.pdf",
+                            path: "/vault/docs/wide.pdf",
+                            page: 1,
+                            zoom: 1,
+                            fitWidth: true,
+                            viewMode: "continuous",
+                            scrollTop: 0,
+                            scrollLeft: 0,
+                        },
+                    ],
+                    historyIndex: 0,
+                },
+            ],
+            "pdf-fit",
+        );
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            kind: "pdf",
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
     it("keeps review tabs when hydrating a detached-window transfer", () => {
         useEditorStore.getState().hydrateTabs(
             [
@@ -1073,6 +1114,56 @@ describe("editorStore hydration and external insertion", () => {
         expect(historyTabs).toHaveLength(1);
         expect(historyTabs[0]?.id).toBe("history-existing");
         expect(state.activeTabId).toBe("history-existing");
+    });
+
+    it("applies the configured fit-width default when inserting a new external pdf tab", () => {
+        useEditorStore.getState().insertExternalTab({
+            id: "pdf-sidebar",
+            kind: "pdf",
+            entryId: "docs/sidebar",
+            title: "sidebar.pdf",
+            path: "/vault/docs/sidebar.pdf",
+            page: 1,
+            zoom: 1,
+            viewMode: "continuous",
+        });
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            id: "pdf-sidebar",
+            entryId: "docs/sidebar",
+            zoom: 1,
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
+    it("preserves an explicit external pdf zoom state", () => {
+        useEditorStore.getState().insertExternalTab({
+            id: "pdf-transfer",
+            kind: "pdf",
+            entryId: "docs/transfer",
+            title: "transfer.pdf",
+            path: "/vault/docs/transfer.pdf",
+            page: 5,
+            zoom: 1.5,
+            fitWidth: false,
+            viewMode: "single",
+            scrollTop: 120,
+            scrollLeft: 40,
+        });
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            id: "pdf-transfer",
+            page: 5,
+            zoom: 1.5,
+            fitWidth: false,
+            viewMode: "single",
+            scrollTop: 120,
+            scrollLeft: 40,
+            history: [expect.objectContaining({ fitWidth: false })],
+        });
     });
 
     it("skips invalid external map tabs that cannot resolve a relative path", () => {
@@ -3165,6 +3256,91 @@ describe("editorStore tab management", () => {
             scrollTop: 1249,
             scrollLeft: 319,
         });
+    });
+
+    it("opens a new pdf with the configured fit-width default", () => {
+        useVaultStore.setState({ vaultPath: "/vaults/project-alpha" });
+
+        useEditorStore
+            .getState()
+            .openPdf("docs/wide", "wide.pdf", "/vault/docs/wide.pdf");
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            entryId: "docs/wide",
+            zoom: 1,
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
+    it("applies the configured fit-width default when opening a pdf into history", () => {
+        useVaultStore.setState({ vaultPath: "/vaults/project-alpha" });
+        useEditorStore.setState({
+            tabs: [
+                makePdfTab({
+                    id: "pdf-tab-a",
+                    entryId: "docs/alpha",
+                    title: "alpha.pdf",
+                    path: "/vault/docs/alpha.pdf",
+                    page: 3,
+                    zoom: 1.5,
+                    fitWidth: false,
+                    viewMode: "single",
+                }),
+            ],
+            activeTabId: "pdf-tab-a",
+        });
+
+        useEditorStore
+            .getState()
+            .openPdf("docs/beta", "beta.pdf", "/vault/docs/beta.pdf");
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            entryId: "docs/beta",
+            zoom: 1,
+            fitWidth: true,
+            historyIndex: 1,
+        });
+        expect(
+            isPdfTab(pdfTab) ? pdfTab.history[pdfTab.historyIndex] : null,
+        ).toMatchObject({ kind: "pdf", fitWidth: true });
+    });
+
+    it("toggles pdf fit-width and clears it when an explicit zoom is set", () => {
+        useEditorStore.setState({
+            tabs: [
+                makePdfTab({
+                    id: "pdf-fit",
+                    entryId: "docs/wide",
+                    title: "wide.pdf",
+                    path: "/vault/docs/wide.pdf",
+                    zoom: 1,
+                    fitWidth: false,
+                }),
+            ],
+            activeTabId: "pdf-fit",
+        });
+
+        useEditorStore.getState().updatePdfFitWidth("pdf-fit", true);
+        let pdfTab = useEditorStore
+            .getState()
+            .tabs.find((tab) => tab.id === "pdf-fit");
+        expect(isPdfTab(pdfTab) ? pdfTab.fitWidth : null).toBe(true);
+
+        // Setting an explicit zoom leaves fit mode.
+        useEditorStore.getState().updatePdfZoom("pdf-fit", 1.5);
+        pdfTab = useEditorStore
+            .getState()
+            .tabs.find((tab) => tab.id === "pdf-fit");
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            zoom: 1.5,
+            fitWidth: false,
+        });
+        expect(
+            isPdfTab(pdfTab) ? pdfTab.history[pdfTab.historyIndex] : null,
+        ).toMatchObject({ kind: "pdf", zoom: 1.5, fitWidth: false });
     });
 
     it("hydrates pane workspaces while mirroring the focused pane into legacy fields", () => {

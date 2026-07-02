@@ -1,6 +1,7 @@
 import {
     useCallback,
     useEffect,
+    useLayoutEffect,
     useMemo,
     useRef,
     useState,
@@ -36,6 +37,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+// Bounds for the zoom derived by fit-to-width, so an unusual page size can't
+// push the render to an absurd scale.
+const FIT_WIDTH_MIN_ZOOM = 0.1;
+const FIT_WIDTH_MAX_ZOOM = 5;
 const CONTINUOUS_PAGE_GAP = 20;
 const CONTINUOUS_OVERSCAN_PX = 1200;
 const CONTINUOUS_MAX_RENDERED_PAGES = 15;
@@ -146,6 +151,11 @@ type PdfPageLayout = PdfPageMetric & {
 type PdfScrollPosition = {
     top: number;
     left: number;
+};
+
+type PdfContinuousScrollAnchor = {
+    pageNumber: number;
+    pageOffsetRatio: number;
 };
 
 function normalizeScrollPosition(position: PdfScrollPosition) {
@@ -282,6 +292,37 @@ function findClosestLayoutIndex(
     return nextDistance < currentDistance ? nextIndex : currentIndex;
 }
 
+function createContinuousScrollAnchor(
+    layouts: PdfPageLayout[],
+    scrollTop: number,
+): PdfContinuousScrollAnchor | null {
+    if (layouts.length === 0) return null;
+
+    const index = findLastLayoutStartingBefore(layouts, scrollTop);
+    const layout = layouts[index] ?? layouts[0];
+    const offsetWithinPage = Math.min(
+        Math.max(scrollTop - layout.offsetTop, 0),
+        layout.height,
+    );
+
+    return {
+        pageNumber: layout.pageNumber,
+        pageOffsetRatio:
+            layout.height > 0 ? offsetWithinPage / layout.height : 0,
+    };
+}
+
+function resolveContinuousScrollAnchor(
+    layouts: PdfPageLayout[],
+    anchor: PdfContinuousScrollAnchor,
+) {
+    const layout =
+        layouts.find((candidate) => candidate.pageNumber === anchor.pageNumber) ??
+        layouts[0];
+    if (!layout) return 0;
+    return layout.offsetTop + layout.height * anchor.pageOffsetRatio;
+}
+
 function clampContinuousWindow(
     layouts: PdfPageLayout[],
     startIndex: number,
@@ -343,6 +384,13 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
     const completedScrollRestoreKeyRef = useRef<string | null>(null);
     const restoreAnimationFrameRef = useRef<number | null>(null);
     const isRestoringScrollRef = useRef(false);
+    const previousFitWidthLayoutsRef = useRef<{
+        tabId: string;
+        path: string;
+        viewMode: PdfTab["viewMode"];
+        effectiveZoom: number;
+        layouts: PdfPageLayout[];
+    } | null>(null);
     const lastPersistedScrollTopRef = useRef(tab.scrollTop);
     const lastPersistedScrollLeftRef = useRef(tab.scrollLeft);
     const spacePressedRef = useRef(false);
@@ -374,11 +422,15 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
     const [viewportWidth, setViewportWidth] = useState(0);
     const [singlePageSize, setSinglePageSize] =
         useState<PdfRenderedPageSize | null>(null);
+    const [currentPageNaturalWidth, setCurrentPageNaturalWidth] = useState<
+        number | null
+    >(null);
     const [isPanModifierActive, setIsPanModifierActive] = useState(false);
     const [isDraggingToPan, setIsDraggingToPan] = useState(false);
 
     const updatePdfPage = useEditorStore((s) => s.updatePdfPage);
     const updatePdfZoom = useEditorStore((s) => s.updatePdfZoom);
+    const updatePdfFitWidth = useEditorStore((s) => s.updatePdfFitWidth);
     const updatePdfViewMode = useEditorStore((s) => s.updatePdfViewMode);
     const updatePdfScrollPosition = useEditorStore(
         (s) => s.updatePdfScrollPosition,
@@ -399,7 +451,29 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
     const loading = !error && !activePdf;
     const pdf = activePdf?.pdf ?? null;
     const numPages = activePdf?.numPages ?? 0;
-    const effectiveZoom = tab.zoom;
+    const fitWidthZoom = useMemo(() => {
+        if (!tab.fitWidth) return null;
+        const naturalWidth =
+            (tab.viewMode === "continuous"
+                ? pageMetrics?.find((m) => m.pageNumber === tab.page)?.width
+                : undefined) ?? currentPageNaturalWidth;
+        if (!naturalWidth || naturalWidth <= 0) return null;
+        const available = viewportWidth - PDF_SURFACE_PADDING_PX * 2;
+        if (available <= 0) return null;
+        return Math.min(
+            FIT_WIDTH_MAX_ZOOM,
+            Math.max(FIT_WIDTH_MIN_ZOOM, available / naturalWidth),
+        );
+    }, [
+        currentPageNaturalWidth,
+        pageMetrics,
+        tab.fitWidth,
+        tab.page,
+        tab.viewMode,
+        viewportWidth,
+    ]);
+    const effectiveZoom =
+        tab.fitWidth && fitWidthZoom != null ? fitWidthZoom : tab.zoom;
     const continuousLayouts = useMemo(
         () => (pageMetrics ? buildPageLayouts(pageMetrics, effectiveZoom) : []),
         [effectiveZoom, pageMetrics],
@@ -408,6 +482,7 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
         viewportHeight,
         VIEWPORT_HEIGHT_FALLBACK,
     );
+    const scrollRestoreZoomKey = tab.fitWidth ? "fit-width" : effectiveZoom;
     const scrollRestoreKey = useMemo(
         () =>
             [
@@ -415,9 +490,9 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                 tab.path,
                 retryCount,
                 tab.viewMode,
-                effectiveZoom,
+                scrollRestoreZoomKey,
             ].join(":"),
-        [effectiveZoom, retryCount, tab.id, tab.path, tab.viewMode],
+        [retryCount, scrollRestoreZoomKey, tab.id, tab.path, tab.viewMode],
     );
     const visibleContinuousLayouts = useMemo(() => {
         if (tab.viewMode !== "continuous" || continuousLayouts.length === 0) {
@@ -712,7 +787,7 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
         if (!scrollContainer) return;
 
         let frame = 0;
-        const scheduleSync = () => {
+        const scheduleScrollSync = () => {
             // A real scroll event should win over a pending restore. This keeps
             // user-driven continuous scroll from being dropped in the frame
             // between mounting the surface and completing scroll restoration.
@@ -729,12 +804,23 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                 syncScrollStateFromContainer(scrollContainer),
             );
         };
+        const scheduleResizeSync = () => {
+            window.cancelAnimationFrame(frame);
+            frame = window.requestAnimationFrame(() =>
+                syncScrollStateFromContainer(scrollContainer),
+            );
+        };
 
         syncScrollStateFromContainer(scrollContainer);
-        scrollContainer.addEventListener("scroll", scheduleSync, {
+        scrollContainer.addEventListener("scroll", scheduleScrollSync, {
             passive: true,
         });
-        window.addEventListener("resize", scheduleSync);
+        window.addEventListener("resize", scheduleResizeSync);
+        const resizeObserver =
+            typeof ResizeObserver === "undefined"
+                ? null
+                : new ResizeObserver(scheduleResizeSync);
+        resizeObserver?.observe(scrollContainer);
         return () => {
             window.cancelAnimationFrame(frame);
             persistScrollPosition(
@@ -744,13 +830,79 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                 },
                 true,
             );
-            scrollContainer.removeEventListener("scroll", scheduleSync);
-            window.removeEventListener("resize", scheduleSync);
+            resizeObserver?.disconnect();
+            scrollContainer.removeEventListener("scroll", scheduleScrollSync);
+            window.removeEventListener("resize", scheduleResizeSync);
         };
     }, [
         persistScrollPosition,
         scrollContainer,
         syncScrollStateFromContainer,
+    ]);
+
+    useLayoutEffect(() => {
+        const previous = previousFitWidthLayoutsRef.current;
+        previousFitWidthLayoutsRef.current = {
+            tabId: tab.id,
+            path: tab.path,
+            viewMode: tab.viewMode,
+            effectiveZoom,
+            layouts: continuousLayouts,
+        };
+
+        if (
+            !tab.fitWidth ||
+            !scrollContainer ||
+            tab.viewMode !== "continuous" ||
+            continuousLayouts.length === 0 ||
+            !previous ||
+            previous.tabId !== tab.id ||
+            previous.path !== tab.path ||
+            previous.viewMode !== tab.viewMode ||
+            previous.layouts.length === 0 ||
+            Math.abs(previous.effectiveZoom - effectiveZoom) < 0.0001
+        ) {
+            return;
+        }
+
+        const anchor = createContinuousScrollAnchor(
+            previous.layouts,
+            scrollContainer.scrollTop,
+        );
+        if (!anchor) return;
+
+        const nextScrollTop = resolveContinuousScrollAnchor(
+            continuousLayouts,
+            anchor,
+        );
+        if (Math.abs(nextScrollTop - scrollContainer.scrollTop) < 1) {
+            return;
+        }
+
+        scrollContainer.scrollTo({
+            top: Math.max(0, nextScrollTop),
+            left: scrollContainer.scrollLeft,
+            behavior: "auto",
+        });
+        syncScrollStateFromContainer(scrollContainer);
+        persistScrollPosition(
+            {
+                top: scrollContainer.scrollTop,
+                left: scrollContainer.scrollLeft,
+            },
+            false,
+            true,
+        );
+    }, [
+        continuousLayouts,
+        effectiveZoom,
+        persistScrollPosition,
+        scrollContainer,
+        syncScrollStateFromContainer,
+        tab.fitWidth,
+        tab.id,
+        tab.path,
+        tab.viewMode,
     ]);
 
     useEffect(() => {
@@ -853,6 +1005,33 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
         };
     }, [pageMetrics, pdf, setPdfError, tab.viewMode]);
 
+    // Track the current page's unscaled width so fit-to-width can be computed
+    // in either view mode (continuous relies on pageMetrics, single-page does
+    // not). A failed lookup just leaves fit-width falling back to tab.zoom.
+    useEffect(() => {
+        if (!pdf) {
+            setCurrentPageNaturalWidth(null);
+            return;
+        }
+
+        let cancelled = false;
+        pdf.getPage(tab.page)
+            .then((page) => {
+                const viewport = page.getViewport({ scale: 1 });
+                page.cleanup?.();
+                if (!cancelled) {
+                    setCurrentPageNaturalWidth(viewport.width);
+                }
+            })
+            .catch(() => {
+                /* fit-width falls back to the stored zoom */
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [pdf, tab.page]);
+
     useEffect(() => {
         if (tab.viewMode !== "continuous" || continuousLayouts.length === 0) {
             return;
@@ -925,6 +1104,16 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
     const zoomOut = useCallback(() => {
         updatePdfZoom(tab.id, clampZoom(effectiveZoom, "out"));
     }, [effectiveZoom, tab.id, updatePdfZoom]);
+
+    const toggleFitWidth = useCallback(() => {
+        if (tab.fitWidth) {
+            // Leaving fit mode: keep the current visual size by pinning the
+            // resolved zoom, so the page does not jump.
+            updatePdfZoom(tab.id, effectiveZoom);
+            return;
+        }
+        updatePdfFitWidth(tab.id, true);
+    }, [effectiveZoom, tab.fitWidth, tab.id, updatePdfFitWidth, updatePdfZoom]);
 
     const toggleViewMode = useCallback(() => {
         const nextViewMode =
@@ -1463,6 +1652,19 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                     <PlusIcon />
                 </ToolbarButton>
 
+                <ToolbarButton
+                    onClick={toggleFitWidth}
+                    active={tab.fitWidth}
+                    title={
+                        tab.fitWidth
+                            ? "Fit width (on)"
+                            : "Fit page width to the window"
+                    }
+                >
+                    <FitWidthIcon />
+                    <span>Fit Width</span>
+                </ToolbarButton>
+
                 <div
                     style={{
                         width: 1,
@@ -1908,6 +2110,25 @@ function PlusIcon() {
             strokeLinecap="round"
         >
             <path d="M8 4v8M4 8h8" />
+        </svg>
+    );
+}
+
+function FitWidthIcon() {
+    return (
+        <svg
+            width="14"
+            height="14"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+        >
+            <path d="M5 3.5h6a1 1 0 011 1v7a1 1 0 01-1 1H5a1 1 0 01-1-1v-7a1 1 0 011-1z" />
+            <path d="M1 8h2.5M3 6.5 1.5 8 3 9.5" />
+            <path d="M15 8h-2.5M13 6.5 14.5 8 13 9.5" />
         </svg>
     );
 }

@@ -47,7 +47,7 @@ import {
     type ResourceReloadDetail,
     type ResourceReloadMetadata,
 } from "./editorResourceRegistry";
-import { useSettingsStore } from "./settingsStore";
+import { resolvePdfInitialZoom, useSettingsStore } from "./settingsStore";
 import { useVaultStore } from "./vaultStore";
 import {
     balanceSplit,
@@ -268,6 +268,7 @@ export interface EditorWorkspaceActions {
     ) => void;
     updatePdfPage: (tabId: string, page: number) => void;
     updatePdfZoom: (tabId: string, zoom: number) => void;
+    updatePdfFitWidth: (tabId: string, fitWidth: boolean) => void;
     updatePdfViewMode: (tabId: string, viewMode: PdfViewMode) => void;
     updatePdfScrollTop: (tabId: string, scrollTop: number) => void;
     updatePdfScrollPosition: (
@@ -1073,6 +1074,15 @@ function normalizeHydratedTab(tab: TabInput): Tab | null {
 }
 
 function normalizeExternalTab(tab: TabInput): Tab | null {
+    if (isPdfTab(tab)) {
+        const shouldApplyInitialZoom =
+            tab.fitWidth === undefined &&
+            (!tab.history || tab.history.length === 0);
+        const input = shouldApplyInitialZoom
+            ? { ...tab, ...resolvePdfInitialZoom() }
+            : tab;
+        return normalizeHistoryTab(input);
+    }
     if (isHistoryTab(tab)) {
         return normalizeHistoryTab(tab);
     }
@@ -3760,11 +3770,62 @@ export function createEditorWorkspaceSlice<TState extends EditorWorkspaceStore>(
                         !isPdfTab(tab)
                             ? tab
                             : patchCurrentHistoryEntry(tab, (entry) =>
-                                  entry.kind !== "pdf" || entry.zoom === zoom
+                                  entry.kind !== "pdf" ||
+                                  (entry.zoom === zoom && !entry.fitWidth)
                                       ? entry
                                       : {
                                             ...entry,
                                             zoom,
+                                            // An explicit zoom leaves fit mode.
+                                            fitWidth: false,
+                                        },
+                              ),
+                );
+
+                if (nextTabs === targetPane.tabs) {
+                    return state;
+                }
+
+                return replacePaneInWorkspace(
+                    workspace,
+                    targetPane.id,
+                    createEditorPaneState(targetPane.id, {
+                        ...targetPane,
+                        tabs: nextTabs,
+                        tabsById: state.tabsById,
+                    }),
+                    {
+                        focusedPaneId: workspace.focusedPaneId,
+                        tabsById: state.tabsById,
+                    },
+                );
+            });
+        },
+
+        updatePdfFitWidth: (tabId, fitWidth) => {
+            set((state) => {
+                const workspace = getEffectivePaneWorkspace(state);
+                const targetPane = findPaneContainingTab(
+                    workspace.panes,
+                    tabId,
+                );
+                if (!targetPane) {
+                    return state;
+                }
+
+                const nextTabs = patchHistoryTabById(
+                    targetPane.tabs,
+                    tabId,
+                    (tab) =>
+                        !isPdfTab(tab)
+                            ? tab
+                            : patchCurrentHistoryEntry(tab, (entry) =>
+                                  entry.kind !== "pdf" ||
+                                  entry.fitWidth === fitWidth
+                                      ? entry
+                                      : {
+                                            ...entry,
+                                            fitWidth,
                                         },
                               ),
                 );
