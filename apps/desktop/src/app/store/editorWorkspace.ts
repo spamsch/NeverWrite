@@ -47,7 +47,7 @@ import {
     type ResourceReloadDetail,
     type ResourceReloadMetadata,
 } from "./editorResourceRegistry";
-import { useSettingsStore } from "./settingsStore";
+import { resolvePdfInitialZoom, useSettingsStore } from "./settingsStore";
 import { useVaultStore } from "./vaultStore";
 import {
     balanceSplit,
@@ -1074,6 +1074,15 @@ function normalizeHydratedTab(tab: TabInput): Tab | null {
 }
 
 function normalizeExternalTab(tab: TabInput): Tab | null {
+    if (isPdfTab(tab)) {
+        const shouldApplyInitialZoom =
+            tab.fitWidth === undefined &&
+            (!tab.history || tab.history.length === 0);
+        const input = shouldApplyInitialZoom
+            ? { ...tab, ...resolvePdfInitialZoom() }
+            : tab;
+        return normalizeHistoryTab(input);
+    }
     if (isHistoryTab(tab)) {
         return normalizeHistoryTab(tab);
     }

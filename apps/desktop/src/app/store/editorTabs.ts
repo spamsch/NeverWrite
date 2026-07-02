@@ -931,6 +931,7 @@ export function ensurePdfTabDefaults(tab: PdfTabInput): PdfTab {
                 history.length - 1,
             ),
         );
+        const currentEntry = history[historyIndex];
         history[historyIndex] = createPdfHistoryEntry(
             tab.entryId,
             tab.title,
@@ -940,7 +941,8 @@ export function ensurePdfTabDefaults(tab: PdfTabInput): PdfTab {
             tab.viewMode ?? "continuous",
             tab.scrollTop ?? 0,
             tab.scrollLeft ?? 0,
-            tab.fitWidth ?? false,
+            tab.fitWidth ??
+                (currentEntry?.kind === "pdf" && currentEntry.fitWidth),
         );
         return buildTabFromHistory(tab.id, history, historyIndex) as PdfTab;
     }

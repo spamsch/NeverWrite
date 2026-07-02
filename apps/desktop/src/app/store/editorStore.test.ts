@@ -1116,6 +1116,56 @@ describe("editorStore hydration and external insertion", () => {
         expect(state.activeTabId).toBe("history-existing");
     });
 
+    it("applies the configured fit-width default when inserting a new external pdf tab", () => {
+        useEditorStore.getState().insertExternalTab({
+            id: "pdf-sidebar",
+            kind: "pdf",
+            entryId: "docs/sidebar",
+            title: "sidebar.pdf",
+            path: "/vault/docs/sidebar.pdf",
+            page: 1,
+            zoom: 1,
+            viewMode: "continuous",
+        });
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            id: "pdf-sidebar",
+            entryId: "docs/sidebar",
+            zoom: 1,
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
+    it("preserves an explicit external pdf zoom state", () => {
+        useEditorStore.getState().insertExternalTab({
+            id: "pdf-transfer",
+            kind: "pdf",
+            entryId: "docs/transfer",
+            title: "transfer.pdf",
+            path: "/vault/docs/transfer.pdf",
+            page: 5,
+            zoom: 1.5,
+            fitWidth: false,
+            viewMode: "single",
+            scrollTop: 120,
+            scrollLeft: 40,
+        });
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            id: "pdf-transfer",
+            page: 5,
+            zoom: 1.5,
+            fitWidth: false,
+            viewMode: "single",
+            scrollTop: 120,
+            scrollLeft: 40,
+            history: [expect.objectContaining({ fitWidth: false })],
+        });
+    });
+
     it("skips invalid external map tabs that cannot resolve a relative path", () => {
         useEditorStore.getState().insertExternalTab({
             id: "map-invalid",

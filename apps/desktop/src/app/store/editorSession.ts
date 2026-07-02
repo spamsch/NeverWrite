@@ -78,6 +78,7 @@ type PersistedPdfWorkspaceTab = {
     path: string;
     page?: number;
     zoom?: number;
+    fitWidth?: boolean;
     viewMode?: PdfViewMode;
     scrollTop?: number;
     scrollLeft?: number;
@@ -87,6 +88,7 @@ type PersistedPdfWorkspaceTab = {
         path: string;
         page?: number;
         zoom?: number;
+        fitWidth?: boolean;
         viewMode?: PdfViewMode;
         scrollTop?: number;
         scrollLeft?: number;
@@ -191,6 +193,7 @@ export interface PersistedLegacySession {
         path: string;
         page?: number;
         zoom?: number;
+        fitWidth?: boolean;
         viewMode?: PdfViewMode;
         scrollTop?: number;
         scrollLeft?: number;
@@ -200,6 +203,7 @@ export interface PersistedLegacySession {
             path: string;
             page?: number;
             zoom?: number;
+            fitWidth?: boolean;
             viewMode?: PdfViewMode;
             scrollTop?: number;
             scrollLeft?: number;
@@ -792,6 +796,7 @@ async function restorePersistedWorkspaceTabsById(
                 path: tab.path,
                 page: tab.page ?? 1,
                 zoom: tab.zoom ?? 1,
+                fitWidth: tab.fitWidth ?? false,
                 viewMode: tab.viewMode ?? "continuous",
                 scrollTop: tab.scrollTop ?? 0,
                 scrollLeft: tab.scrollLeft ?? 0,
@@ -994,6 +999,7 @@ function restoreLegacyPdfTabs(session: PersistedLegacySession) {
                     path: entry.path,
                     page: entry.page ?? 1,
                     zoom: entry.zoom ?? 1,
+                    fitWidth: entry.fitWidth ?? false,
                     viewMode: entry.viewMode ?? "continuous",
                     scrollTop: entry.scrollTop ?? 0,
                     scrollLeft: entry.scrollLeft ?? 0,
@@ -1005,6 +1011,7 @@ function restoreLegacyPdfTabs(session: PersistedLegacySession) {
             path: historyEntry.path,
             page: historyEntry.page ?? 1,
             zoom: historyEntry.zoom ?? 1,
+            fitWidth: historyEntry.fitWidth ?? false,
             viewMode: historyEntry.viewMode ?? "continuous",
             scrollTop: historyEntry.scrollTop ?? 0,
             scrollLeft: historyEntry.scrollLeft ?? 0,
@@ -1022,6 +1029,7 @@ function restoreLegacyPdfTabs(session: PersistedLegacySession) {
             path: currentEntry?.path ?? entry.path,
             page: currentEntry?.page ?? entry.page ?? 1,
             zoom: currentEntry?.zoom ?? entry.zoom ?? 1,
+            fitWidth: currentEntry?.fitWidth ?? entry.fitWidth ?? false,
             viewMode: currentEntry?.viewMode ?? entry.viewMode ?? "continuous",
             scrollTop: currentEntry?.scrollTop ?? entry.scrollTop ?? 0,
             scrollLeft: currentEntry?.scrollLeft ?? entry.scrollLeft ?? 0,
