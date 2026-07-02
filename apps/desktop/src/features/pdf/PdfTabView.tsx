@@ -46,6 +46,7 @@ const CONTINUOUS_OVERSCAN_PX = 1200;
 const CONTINUOUS_MAX_RENDERED_PAGES = 15;
 const VIEWPORT_HEIGHT_FALLBACK = 800;
 const PDF_SURFACE_PADDING_PX = 24;
+const PDF_TOOLBAR_COMPACT_WIDTH_PX = 600;
 const SCROLL_PERSIST_THRESHOLD_PX = 24;
 const SCROLL_EDGE_EPSILON_PX = 2;
 const KEYBOARD_HORIZONTAL_PAN_PX = 120;
@@ -540,6 +541,8 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
         tab.viewMode === "continuous"
             ? continuousLayouts.length > 0 && continuousContentWidth > 0
             : Boolean(singlePageSize && singlePageContentWidth > 0);
+    const compactToolbar =
+        viewportWidth > 0 && viewportWidth < PDF_TOOLBAR_COMPACT_WIDTH_PX;
 
     const setPdfError = useCallback(
         (message: string) => {
@@ -1596,7 +1599,6 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                     title="Previous page"
                 >
                     <ChevronLeftIcon />
-                    <span>Previous</span>
                 </ToolbarButton>
 
                 <span
@@ -1605,7 +1607,7 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                         fontVariantNumeric: "tabular-nums",
                     }}
                 >
-                    Page {tab.page} / {numPages}
+                    {tab.page} / {numPages}
                 </span>
 
                 <ToolbarButton
@@ -1613,7 +1615,6 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                     disabled={tab.page >= numPages}
                     title="Next page"
                 >
-                    <span>Next</span>
                     <ChevronRightIcon />
                 </ToolbarButton>
 
@@ -1662,7 +1663,7 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                     }
                 >
                     <FitWidthIcon />
-                    <span>Fit Width</span>
+                    {!compactToolbar && <span>Fit Width</span>}
                 </ToolbarButton>
 
                 <div
@@ -1684,11 +1685,13 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                     }
                 >
                     <StackPagesIcon />
-                    <span>
-                        {tab.viewMode === "continuous"
-                            ? "Continuous"
-                            : "Single Page"}
-                    </span>
+                    {!compactToolbar && (
+                        <span>
+                            {tab.viewMode === "continuous"
+                                ? "Continuous"
+                                : "Single Page"}
+                        </span>
+                    )}
                 </ToolbarButton>
 
                 <div
@@ -1706,14 +1709,14 @@ function PdfViewer({ tab }: { tab: PdfTab }) {
                     title={`Filter: ${activeFilter.label}`}
                 >
                     <FilterIcon />
-                    <span>{activeFilter.label}</span>
+                    {!compactToolbar && <span>{activeFilter.label}</span>}
                 </ToolbarButton>
 
                 <div style={{ flex: 1 }} />
 
                 <ToolbarButton onClick={openExternally} title="Open externally">
                     <ExternalLinkIcon />
-                    <span>Open Externally</span>
+                    {!compactToolbar && <span>Open Externally</span>}
                 </ToolbarButton>
             </div>
 
@@ -2004,25 +2007,35 @@ function ToolbarButton({
 
     return (
         <button
+            type="button"
             onClick={onClick}
             disabled={disabled}
             title={title}
-            className="flex items-center gap-1 px-2 rounded transition-colors"
+            aria-label={title}
+            className="flex min-w-6 items-center justify-center gap-1 rounded transition-[background-color,border-color,color,box-shadow,transform] duration-100 ease-out active:translate-y-px active:scale-[0.96] active:shadow-inner"
             style={{
                 height: 24,
+                padding: "0 7px",
                 opacity: disabled ? 0.35 : 1,
                 cursor: disabled ? "default" : "pointer",
                 color: active ? "var(--text-primary)" : "inherit",
                 background: idleBackground,
-                border: "none",
+                border: "1px solid var(--border)",
+                boxShadow: active
+                    ? "inset 0 1px 2px rgba(0,0,0,0.12)"
+                    : "0 1px 2px rgba(0,0,0,0.05)",
+                whiteSpace: "nowrap",
             }}
             onMouseEnter={(event) => {
                 if (!disabled) {
                     event.currentTarget.style.background = "var(--bg-tertiary)";
+                    event.currentTarget.style.borderColor =
+                        "color-mix(in srgb, var(--text-secondary) 28%, var(--border))";
                 }
             }}
             onMouseLeave={(event) => {
                 event.currentTarget.style.background = idleBackground;
+                event.currentTarget.style.borderColor = "var(--border)";
             }}
         >
             {children}
