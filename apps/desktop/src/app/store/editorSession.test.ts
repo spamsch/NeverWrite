@@ -197,6 +197,57 @@ describe("editorSession", () => {
         expect(session.tabsById["review-1"]).toBeUndefined();
     });
 
+    it("preserves pdf fit-width state through persisted session restore", async () => {
+        const session = buildPersistedSession({
+            tabs: [
+                {
+                    id: "pdf-fit",
+                    kind: "pdf",
+                    entryId: "docs/wide",
+                    title: "wide.pdf",
+                    path: "/vault/docs/wide.pdf",
+                    page: 2,
+                    zoom: 1,
+                    fitWidth: true,
+                    viewMode: "continuous",
+                    scrollTop: 480,
+                    scrollLeft: 0,
+                    history: [
+                        {
+                            kind: "pdf",
+                            entryId: "docs/wide",
+                            title: "wide.pdf",
+                            path: "/vault/docs/wide.pdf",
+                            page: 2,
+                            zoom: 1,
+                            fitWidth: true,
+                            viewMode: "continuous",
+                            scrollTop: 480,
+                            scrollLeft: 0,
+                        },
+                    ],
+                    historyIndex: 0,
+                },
+            ],
+            activeTabId: "pdf-fit",
+        });
+
+        localStorage.setItem(
+            getEditorSessionKey("/vaults/project-alpha"),
+            JSON.stringify(session),
+        );
+
+        const restored = await restorePersistedSession("/vaults/project-alpha");
+        const pdfTab = restored?.tabs.find((tab) => tab.kind === "pdf");
+
+        expect(pdfTab).toMatchObject({
+            kind: "pdf",
+            entryId: "docs/wide",
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
     it("normalizes csv file tabs with the csv viewer by default", () => {
         const normalized = normalizeHistoryTab({
             id: "file-csv",

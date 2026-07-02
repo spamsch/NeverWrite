@@ -906,6 +906,43 @@ describe("editorStore hydration and external insertion", () => {
         });
     });
 
+    it("hydrates pdf fit-width from the current history entry when the tab lacks the field", () => {
+        useEditorStore.getState().hydrateTabs(
+            [
+                {
+                    id: "pdf-fit",
+                    kind: "pdf",
+                    entryId: "docs/wide",
+                    title: "wide.pdf",
+                    path: "/vault/docs/wide.pdf",
+                    history: [
+                        {
+                            kind: "pdf",
+                            entryId: "docs/wide",
+                            title: "wide.pdf",
+                            path: "/vault/docs/wide.pdf",
+                            page: 1,
+                            zoom: 1,
+                            fitWidth: true,
+                            viewMode: "continuous",
+                            scrollTop: 0,
+                            scrollLeft: 0,
+                        },
+                    ],
+                    historyIndex: 0,
+                },
+            ],
+            "pdf-fit",
+        );
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            kind: "pdf",
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
     it("keeps review tabs when hydrating a detached-window transfer", () => {
         useEditorStore.getState().hydrateTabs(
             [
@@ -3169,6 +3206,56 @@ describe("editorStore tab management", () => {
             scrollTop: 1249,
             scrollLeft: 319,
         });
+    });
+
+    it("opens a new pdf with the configured fit-width default", () => {
+        useVaultStore.setState({ vaultPath: "/vaults/project-alpha" });
+
+        useEditorStore
+            .getState()
+            .openPdf("docs/wide", "wide.pdf", "/vault/docs/wide.pdf");
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            entryId: "docs/wide",
+            zoom: 1,
+            fitWidth: true,
+            history: [expect.objectContaining({ fitWidth: true })],
+        });
+    });
+
+    it("applies the configured fit-width default when opening a pdf into history", () => {
+        useVaultStore.setState({ vaultPath: "/vaults/project-alpha" });
+        useEditorStore.setState({
+            tabs: [
+                makePdfTab({
+                    id: "pdf-tab-a",
+                    entryId: "docs/alpha",
+                    title: "alpha.pdf",
+                    path: "/vault/docs/alpha.pdf",
+                    page: 3,
+                    zoom: 1.5,
+                    fitWidth: false,
+                    viewMode: "single",
+                }),
+            ],
+            activeTabId: "pdf-tab-a",
+        });
+
+        useEditorStore
+            .getState()
+            .openPdf("docs/beta", "beta.pdf", "/vault/docs/beta.pdf");
+
+        const pdfTab = useEditorStore.getState().tabs[0];
+        expect(isPdfTab(pdfTab) ? pdfTab : null).toMatchObject({
+            entryId: "docs/beta",
+            zoom: 1,
+            fitWidth: true,
+            historyIndex: 1,
+        });
+        expect(
+            isPdfTab(pdfTab) ? pdfTab.history[pdfTab.historyIndex] : null,
+        ).toMatchObject({ kind: "pdf", fitWidth: true });
     });
 
     it("toggles pdf fit-width and clears it when an explicit zoom is set", () => {
