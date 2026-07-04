@@ -13,6 +13,7 @@ import {
     type Transaction,
 } from "@codemirror/state";
 import { syntaxTree } from "@codemirror/language";
+import type { SyntaxNode } from "@lezer/common";
 import katex from "katex";
 import {
     buildVaultPreviewUrlFromAbsolutePath,
@@ -51,6 +52,7 @@ import {
     getNotePreviewContentState,
     renderEmbedPreview,
 } from "./notePreviewSource";
+import { renderMermaidDiagram } from "../mermaid/mermaidRenderer";
 
 const IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|svg|webp|bmp|ico|avif)([?#].*)?$/i;
 const PDF_EXTENSION = /\.pdf([?#].*)?$/i;
@@ -59,6 +61,7 @@ const TABLE_WIKILINK_RE = /\[\[([^\]]+)\]\]/g;
 const TABLE_URL_RE = /https?:\/\/[^\s<>()"\]]+/g;
 const TABLE_BOLD_RE = /\*\*(?=\S)(.+?\S)\*\*/g;
 const STANDALONE_URL_RE = /^https?:\/\/[^\s<>()"\]]+$/i;
+let nextMermaidPreviewInstanceId = 0;
 type TableAlignment = "left" | "center" | "right";
 export interface TableInteractionHandlers {
     resolveWikilink: (target: string) => boolean;
@@ -79,6 +82,18 @@ type ParsedTableCell = {
 type ParsedTableRow = {
     cells: ParsedTableCell[];
     lineEnd: number;
+};
+type FencedCodeBlockKind = "code" | "mermaid";
+type FencedCodeBlockPreview = {
+    kind: FencedCodeBlockKind;
+    info: string;
+    language: string;
+    code: string;
+    hasContent: boolean;
+    openEnd: number;
+    closeFrom: number;
+    firstContentLineNumber: number;
+    lastContentLineNumber: number;
 };
 
 // Re-exported under its historical name; the implementation now lives in the
@@ -832,12 +847,19 @@ class NoteEmbedWidget extends WidgetType {
 }
 
 class CodeBlockHeaderWidget extends WidgetType {
+    private kind: FencedCodeBlockKind;
     private language: string;
     private code: string;
     private hasContent: boolean;
 
-    constructor(language: string, code: string, hasContent: boolean) {
+    constructor(
+        kind: FencedCodeBlockKind,
+        language: string,
+        code: string,
+        hasContent: boolean,
+    ) {
         super();
+        this.kind = kind;
         this.language = language;
         this.code = code;
         this.hasContent = hasContent;
@@ -845,6 +867,7 @@ class CodeBlockHeaderWidget extends WidgetType {
 
     eq(other: CodeBlockHeaderWidget) {
         return (
+            this.kind === other.kind &&
             this.language === other.language &&
             this.code === other.code &&
             this.hasContent === other.hasContent
@@ -863,6 +886,7 @@ class CodeBlockHeaderWidget extends WidgetType {
         bar.className = this.hasContent
             ? "cm-code-block-header"
             : "cm-code-block-header cm-code-block-header-only";
+        bar.dataset.codeBlockKind = this.kind;
         bar.setAttribute("contenteditable", "false");
 
         const lang = document.createElement("span");
@@ -894,6 +918,75 @@ class CodeBlockHeaderWidget extends WidgetType {
     }
 }
 
+class MermaidDiagramWidget extends WidgetType {
+    private source: string;
+    private diagramId: string;
+
+    constructor(source: string, diagramId: string) {
+        super();
+        this.source = source;
+        this.diagramId = diagramId;
+    }
+
+    eq(other: MermaidDiagramWidget) {
+        return (
+            this.source === other.source && this.diagramId === other.diagramId
+        );
+    }
+
+    toDOM() {
+        const outer = document.createElement("div");
+        outer.className = "cm-mermaid-preview";
+        outer.dataset.mermaidId = this.diagramId;
+        outer.dataset.mermaidSource = this.source;
+        outer.setAttribute("contenteditable", "false");
+
+        const body = document.createElement("div");
+        body.className = "cm-mermaid-preview-body";
+        body.textContent = "Rendering Mermaid diagram...";
+        outer.appendChild(body);
+
+        const expectedId = this.diagramId;
+        const expectedSource = this.source;
+
+        void renderMermaidDiagram(this.source, this.diagramId).then(
+            (result) => {
+                if (
+                    !outer.isConnected ||
+                    outer.dataset.mermaidId !== expectedId ||
+                    outer.dataset.mermaidSource !== expectedSource
+                ) {
+                    return;
+                }
+
+                body.replaceChildren();
+                if (result.status === "ok") {
+                    body.className =
+                        "cm-mermaid-preview-body cm-mermaid-preview-body-rendered";
+                    const svg = parseMermaidSvg(result.svg);
+                    if (svg) {
+                        body.appendChild(svg);
+                    } else {
+                        renderMermaidError(
+                            body,
+                            "Unable to read Mermaid SVG output.",
+                        );
+                    }
+                    return;
+                }
+
+                renderMermaidError(body, result.message);
+            },
+        );
+
+        return outer;
+    }
+
+    ignoreEvent() {
+        return true;
+    }
+}
+
 const codeBlockFenceHidden = Decoration.line({
     class: "cm-code-block-fence-hidden",
 });
@@ -907,68 +1000,176 @@ const codeBlockLineLast = Decoration.line({
 const codeBlockLineOnly = Decoration.line({
     class: "cm-code-block-line cm-code-block-line-first cm-code-block-line-last",
 });
+const mermaidBlockSourceHidden = Decoration.line({
+    class: "cm-code-block-fence-hidden cm-mermaid-source-hidden",
+});
 
-function buildCodeBlockDecorations(state: EditorState): DecorationSet {
+function parseMermaidSvg(svg: string): SVGElement | null {
+    const parsed = new DOMParser().parseFromString(svg, "image/svg+xml");
+    const root = parsed.documentElement;
+    if (root.nodeName.toLowerCase() !== "svg") return null;
+    return document.importNode(root, true) as unknown as SVGElement;
+}
+
+function renderMermaidError(container: HTMLElement, message: string) {
+    container.className = "cm-mermaid-preview-body cm-mermaid-preview-error";
+
+    const title = document.createElement("div");
+    title.className = "cm-mermaid-preview-error-title";
+    title.textContent = "Mermaid diagram error";
+
+    const detail = document.createElement("pre");
+    detail.className = "cm-mermaid-preview-error-message";
+    detail.textContent = message;
+
+    container.appendChild(title);
+    container.appendChild(detail);
+}
+
+export function getFencedCodeBlockKind(info: string): FencedCodeBlockKind {
+    return info.trimStart().split(/\s+/, 1)[0]?.toLowerCase() === "mermaid"
+        ? "mermaid"
+        : "code";
+}
+
+function buildMermaidDiagramId(
+    previewInstanceId: number,
+    source: string,
+    from: number,
+) {
+    return `mermaid-${previewInstanceId}-${from}-${hashString(source)}`;
+}
+
+function hashString(value: string) {
+    let hash = 5381;
+    for (let index = 0; index < value.length; index++) {
+        hash = (hash * 33) ^ value.charCodeAt(index);
+    }
+    return (hash >>> 0).toString(36);
+}
+
+function getFencedCodeBlockPreview(
+    state: EditorState,
+    node: SyntaxNode,
+): FencedCodeBlockPreview | null {
+    const cursor = node.cursor();
+    let openEnd = -1;
+    let closeFrom = -1;
+
+    if (cursor.firstChild()) {
+        do {
+            if (cursor.name !== "CodeMark") continue;
+            if (openEnd < 0) {
+                openEnd = state.doc.lineAt(cursor.from).to;
+            } else {
+                closeFrom = cursor.from;
+            }
+        } while (cursor.nextSibling());
+    }
+
+    if (openEnd < 0) return null;
+
+    const openLine = state.doc.lineAt(node.from);
+    const firstContentLineNumber = openLine.number + 1;
+    const lastContentLineNumber =
+        closeFrom >= 0
+            ? state.doc.lineAt(closeFrom).number - 1
+            : state.doc.lineAt(node.to).number;
+    const hasContent = firstContentLineNumber <= lastContentLineNumber;
+    const infoNode = node.getChild("CodeInfo");
+    const info = infoNode
+        ? state.doc.sliceString(infoNode.from, infoNode.to).trim()
+        : "";
+    const contentStart = Math.min(openEnd + 1, node.to);
+    const contentEnd =
+        closeFrom >= 0 ? Math.max(contentStart, closeFrom) : node.to;
+    let code = state.doc.sliceString(contentStart, contentEnd);
+    if (code.endsWith("\n")) {
+        code = code.slice(0, -1);
+    }
+
+    return {
+        kind: getFencedCodeBlockKind(info),
+        info,
+        language: info,
+        code,
+        hasContent,
+        openEnd,
+        closeFrom,
+        firstContentLineNumber,
+        lastContentLineNumber,
+    };
+}
+
+function buildCodeBlockDecorations(
+    state: EditorState,
+    mermaidPreviewInstanceId: number,
+): DecorationSet {
     const decos: DecoEntry[] = [];
 
     syntaxTree(state).iterate({
         enter(node) {
             if (node.name !== "FencedCode") return;
 
-            const cursor = node.node.cursor();
-            let openEnd = -1;
-            let closeFrom = -1;
-
-            if (cursor.firstChild()) {
-                do {
-                    if (cursor.name !== "CodeMark") continue;
-                    if (openEnd < 0) {
-                        openEnd = state.doc.lineAt(cursor.from).to;
-                    } else {
-                        closeFrom = cursor.from;
-                    }
-                } while (cursor.nextSibling());
+            const previewBlock = getFencedCodeBlockPreview(state, node.node);
+            if (!previewBlock) return;
+            if (
+                previewBlock.kind === "mermaid" &&
+                previewBlock.closeFrom < 0
+            ) {
+                return;
             }
-
-            if (openEnd < 0) return;
 
             const showHeader = true;
 
             const openLine = state.doc.lineAt(node.from);
-            const firstContentLineNum = openLine.number + 1;
-            const lastContentLineNum =
-                closeFrom >= 0
-                    ? state.doc.lineAt(closeFrom).number - 1
-                    : state.doc.lineAt(node.to).number;
-            const hasContent = firstContentLineNum <= lastContentLineNum;
+
+            if (previewBlock.kind === "mermaid") {
+                decos.push({
+                    from: node.from,
+                    to: node.from,
+                    deco: Decoration.widget({
+                        widget: new MermaidDiagramWidget(
+                            previewBlock.code,
+                            buildMermaidDiagramId(
+                                mermaidPreviewInstanceId,
+                                previewBlock.code,
+                                node.from,
+                            ),
+                        ),
+                        block: true,
+                        side: -1,
+                    }),
+                });
+
+                for (
+                    let lineNum = openLine.number;
+                    lineNum <=
+                    (previewBlock.closeFrom >= 0
+                        ? state.doc.lineAt(previewBlock.closeFrom).number
+                        : previewBlock.lastContentLineNumber);
+                    lineNum++
+                ) {
+                    const line = state.doc.line(lineNum);
+                    decos.push({
+                        from: line.from,
+                        to: line.from,
+                        deco: mermaidBlockSourceHidden,
+                    });
+                }
+                return;
+            }
 
             if (showHeader) {
-                const infoNode = node.node.getChild("CodeInfo");
-                const language = infoNode
-                    ? state.doc.sliceString(infoNode.from, infoNode.to).trim()
-                    : "";
-
-                const contentStart = Math.min(openEnd + 1, node.to);
-                const contentEnd =
-                    closeFrom >= 0
-                        ? Math.max(contentStart, closeFrom)
-                        : node.to;
-                let codeContent = state.doc.sliceString(
-                    contentStart,
-                    contentEnd,
-                );
-                if (codeContent.endsWith("\n")) {
-                    codeContent = codeContent.slice(0, -1);
-                }
-
                 decos.push({
                     from: node.from,
                     to: node.from,
                     deco: Decoration.widget({
                         widget: new CodeBlockHeaderWidget(
-                            language,
-                            codeContent,
-                            hasContent,
+                            previewBlock.kind,
+                            previewBlock.language,
+                            previewBlock.code,
+                            previewBlock.hasContent,
                         ),
                         block: true,
                         side: -1,
@@ -984,8 +1185,8 @@ function buildCodeBlockDecorations(state: EditorState): DecorationSet {
             });
 
             // Collapse the closing fence line (```) so it takes no space
-            if (closeFrom >= 0) {
-                const closeLine = state.doc.lineAt(closeFrom);
+            if (previewBlock.closeFrom >= 0) {
+                const closeLine = state.doc.lineAt(previewBlock.closeFrom);
                 decos.push({
                     from: closeLine.from,
                     to: closeLine.from,
@@ -994,13 +1195,14 @@ function buildCodeBlockDecorations(state: EditorState): DecorationSet {
             }
 
             for (
-                let lineNum = firstContentLineNum;
-                lineNum <= lastContentLineNum;
+                let lineNum = previewBlock.firstContentLineNumber;
+                lineNum <= previewBlock.lastContentLineNumber;
                 lineNum++
             ) {
                 const line = state.doc.line(lineNum);
-                const isFirst = lineNum === firstContentLineNum;
-                const isLast = lineNum === lastContentLineNum;
+                const isFirst =
+                    lineNum === previewBlock.firstContentLineNumber;
+                const isLast = lineNum === previewBlock.lastContentLineNumber;
                 const needFirst = isFirst && !showHeader;
 
                 let deco: Decoration;
@@ -1030,6 +1232,37 @@ function buildCodeBlockDecorations(state: EditorState): DecorationSet {
  * decorations instead of rebuilding them from scratch.
  */
 const BLOCK_MARKER_RE = /(?:[`$!|\n#]|\[)/;
+
+function rangesOverlap(fromA: number, toA: number, fromB: number, toB: number) {
+    return fromA <= toB && toA >= fromB;
+}
+
+function transactionTouchesMermaidBlock(tr: Transaction): boolean {
+    if (!tr.docChanged) return false;
+
+    let touchesMermaid = false;
+
+    syntaxTree(tr.startState).iterate({
+        enter(node) {
+            if (touchesMermaid || node.name !== "FencedCode") return;
+
+            const previewBlock = getFencedCodeBlockPreview(
+                tr.startState,
+                node.node,
+            );
+            if (previewBlock?.kind !== "mermaid") return;
+
+            tr.changes.iterChangedRanges((fromA, toA) => {
+                if (touchesMermaid) return;
+                if (rangesOverlap(fromA, toA, node.from, node.to)) {
+                    touchesMermaid = true;
+                }
+            });
+        },
+    });
+
+    return touchesMermaid;
+}
 
 /** Returns true when a transaction requires block decorations to be rebuilt. */
 function needsBlockRebuild(tr: Transaction): boolean {
@@ -1075,13 +1308,18 @@ function needsSyntaxBackedBlockRebuild(tr: Transaction): boolean {
     if (!tr.docChanged && syntaxTree(tr.startState) !== syntaxTree(tr.state)) {
         return true;
     }
+    if (transactionTouchesMermaidBlock(tr)) {
+        return true;
+    }
     return needsBlockRebuild(tr);
 }
 
 export function createCodeBlockLivePreviewExtension() {
+    const mermaidPreviewInstanceId = nextMermaidPreviewInstanceId++;
+
     return StateField.define<DecorationSet>({
         create(state) {
-            return buildCodeBlockDecorations(state);
+            return buildCodeBlockDecorations(state, mermaidPreviewInstanceId);
         },
         update(decorations, transaction) {
             if (!needsSyntaxBackedBlockRebuild(transaction)) {
@@ -1089,7 +1327,10 @@ export function createCodeBlockLivePreviewExtension() {
                     ? decorations.map(transaction.changes)
                     : decorations;
             }
-            return buildCodeBlockDecorations(transaction.state);
+            return buildCodeBlockDecorations(
+                transaction.state,
+                mermaidPreviewInstanceId,
+            );
         },
         provide(field) {
             return EditorView.decorations.from(field);

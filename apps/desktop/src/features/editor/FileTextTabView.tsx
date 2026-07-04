@@ -53,6 +53,9 @@ import {
     changeAuthorAnnotation,
     userEditNotifier,
 } from "./extensions/changeAuthor";
+import { MermaidFilePreview } from "./MermaidFilePreview";
+
+type MermaidFileMode = "source" | "preview";
 
 function FileTabStripButton({
     onClick,
@@ -62,13 +65,20 @@ function FileTabStripButton({
     children: string;
 }) {
     const [hovered, setHovered] = useState(false);
+    const [pressed, setPressed] = useState(false);
     return (
         <button
             type="button"
             onClick={onClick}
             onMouseEnter={() => setHovered(true)}
-            onMouseLeave={() => setHovered(false)}
-            className="rounded-sm px-2 py-0.5 transition-colors uppercase"
+            onMouseLeave={() => {
+                setHovered(false);
+                setPressed(false);
+            }}
+            onMouseDown={() => setPressed(true)}
+            onMouseUp={() => setPressed(false)}
+            onBlur={() => setPressed(false)}
+            className="rounded-sm px-2 py-0.5 uppercase"
             style={{
                 fontSize: "10px",
                 fontWeight: 600,
@@ -77,11 +87,71 @@ function FileTabStripButton({
                     ? "var(--text-primary)"
                     : "var(--text-secondary)",
                 backgroundColor: hovered
-                    ? "color-mix(in srgb, var(--text-primary) 7%, transparent)"
-                    : "transparent",
+                    ? "color-mix(in srgb, var(--bg-tertiary) 78%, transparent)"
+                    : "var(--bg-primary)",
                 border: `1px solid color-mix(in srgb, var(--border) ${
-                    hovered ? "70%" : "0%"
+                    hovered ? "78%" : "62%"
                 }, transparent)`,
+                boxShadow: pressed
+                    ? "inset 0 1px 2px color-mix(in srgb, black 22%, transparent)"
+                    : "0 1px 1px color-mix(in srgb, black 8%, transparent), inset 0 1px 0 color-mix(in srgb, white 14%, transparent)",
+                transform: hovered && !pressed ? "translateY(-1px)" : "none",
+                transition:
+                    "background-color 100ms ease, border-color 100ms ease, box-shadow 100ms ease, color 100ms ease, transform 100ms ease",
+                cursor: "pointer",
+            }}
+        >
+            {children}
+        </button>
+    );
+}
+
+function FileTabModeButton({
+    active,
+    onClick,
+    children,
+}: {
+    active: boolean;
+    onClick: () => void;
+    children: string;
+}) {
+    const [hovered, setHovered] = useState(false);
+    const [pressed, setPressed] = useState(false);
+    const isPressed = active || pressed;
+
+    return (
+        <button
+            type="button"
+            aria-pressed={active}
+            onClick={onClick}
+            onMouseEnter={() => setHovered(true)}
+            onMouseLeave={() => {
+                setHovered(false);
+                setPressed(false);
+            }}
+            onMouseDown={() => setPressed(true)}
+            onMouseUp={() => setPressed(false)}
+            onBlur={() => setPressed(false)}
+            className="rounded-sm px-2 py-0.5 uppercase"
+            style={{
+                fontSize: "10px",
+                fontWeight: 600,
+                letterSpacing: "0.04em",
+                color: active ? "var(--text-primary)" : "var(--text-secondary)",
+                backgroundColor: active
+                    ? "color-mix(in srgb, var(--accent) 16%, var(--bg-primary))"
+                    : hovered
+                      ? "color-mix(in srgb, var(--bg-tertiary) 78%, transparent)"
+                      : "var(--bg-primary)",
+                border: active
+                    ? "1px solid color-mix(in srgb, var(--accent) 48%, var(--border))"
+                    : "1px solid color-mix(in srgb, var(--border) 72%, transparent)",
+                boxShadow: isPressed
+                    ? "inset 0 1px 2px color-mix(in srgb, black 22%, transparent)"
+                    : "0 1px 1px color-mix(in srgb, black 10%, transparent), inset 0 1px 0 color-mix(in srgb, white 16%, transparent)",
+                transform: hovered && !isPressed ? "translateY(-1px)" : "none",
+                transition:
+                    "background-color 100ms ease, border-color 100ms ease, box-shadow 100ms ease, color 100ms ease, transform 100ms ease",
                 cursor: "pointer",
             }}
         >
@@ -106,6 +176,9 @@ export function FileTextTabView({ paneId, tabId }: FileTextTabViewProps) {
     const contextMenuCleanupRef = useRef<(() => void) | null>(null);
     const applyingExternalUpdateRef = useRef(false);
     const [, setEditorView] = useState<EditorView | null>(null);
+    const [mermaidSource, setMermaidSource] = useState("");
+    const [mermaidMode, setMermaidMode] =
+        useState<MermaidFileMode>("source");
     const [editorContextMenu, setEditorContextMenu] =
         useState<ContextMenuState<{
             hasSelection: boolean;
@@ -154,6 +227,7 @@ export function FileTextTabView({ paneId, tabId }: FileTextTabViewProps) {
             annotations: [changeAuthorAnnotation.of("agent")],
         });
         applyingExternalUpdateRef.current = false;
+        setMermaidSource(nextContent);
     }, []);
 
     const {
@@ -399,6 +473,7 @@ export function FileTextTabView({ paneId, tabId }: FileTextTabViewProps) {
                         }
 
                         handleLocalContentChange(update.state.doc.toString());
+                        setMermaidSource(update.state.doc.toString());
                     }),
                     userEditNotifier(
                         () => tabRef.current?.path ?? null,
@@ -529,6 +604,15 @@ export function FileTextTabView({ paneId, tabId }: FileTextTabViewProps) {
 
     const tabPath = tab?.path ?? null;
     const tabContent = tab?.content ?? null;
+
+    useEffect(() => {
+        if (tab?.viewer !== "mermaid") {
+            setMermaidSource("");
+            setMermaidMode("source");
+            return;
+        }
+        setMermaidSource(tab.content);
+    }, [tab?.content, tab?.id, tab?.viewer]);
 
     useEffect(() => {
         if (!tabPath || tabContent == null) {
@@ -694,6 +778,30 @@ export function FileTextTabView({ paneId, tabId }: FileTextTabViewProps) {
                     </span>
                 </div>
                 <div className="flex items-center gap-0.5 shrink-0">
+                    {tab.viewer === "mermaid" ? (
+                        <div
+                            className="mr-1 flex items-center gap-0.5 rounded-sm p-0.5"
+                            style={{
+                                border: "1px solid var(--border)",
+                                backgroundColor:
+                                    "color-mix(in srgb, var(--bg-secondary) 72%, var(--bg-primary))",
+                            }}
+                            aria-label="Mermaid file mode"
+                        >
+                            <FileTabModeButton
+                                active={mermaidMode === "source"}
+                                onClick={() => setMermaidMode("source")}
+                            >
+                                Source
+                            </FileTabModeButton>
+                            <FileTabModeButton
+                                active={mermaidMode === "preview"}
+                                onClick={() => setMermaidMode("preview")}
+                            >
+                                Preview
+                            </FileTabModeButton>
+                        </div>
+                    ) : null}
                     <FileTabStripButton onClick={() => void openPath(tab.path)}>
                         Open Externally
                     </FileTabStripButton>
@@ -707,12 +815,29 @@ export function FileTextTabView({ paneId, tabId }: FileTextTabViewProps) {
 
             <div className="min-h-0 flex-1 relative">
                 <div className="flex h-full min-w-0">
-                    <div className="min-w-0 flex-1 relative">
+                    <div
+                        className="min-w-0 flex-1 relative"
+                        style={{
+                            display:
+                                tab.viewer === "mermaid" &&
+                                mermaidMode === "preview"
+                                    ? "none"
+                                    : undefined,
+                        }}
+                    >
                         <div
                             ref={containerRef}
                             className="h-full relative z-1"
                         />
                     </div>
+                    {tab.viewer === "mermaid" && mermaidMode === "preview" ? (
+                        <div className="min-w-0 flex-1">
+                            <MermaidFilePreview
+                                source={mermaidSource}
+                                tabId={tab.id}
+                            />
+                        </div>
+                    ) : null}
                 </div>
             </div>
             {editorContextMenu && (

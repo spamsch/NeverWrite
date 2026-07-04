@@ -904,6 +904,53 @@ export const livePreviewTheme = EditorView.baseTheme({
         borderRadius: "0 0 8px 8px",
         paddingBottom: "8px !important",
     },
+    ".cm-mermaid-preview": {
+        margin: "12px 0",
+        maxWidth: "100%",
+        overflowX: "auto",
+        borderTop: "1px solid var(--border)",
+        borderBottom: "1px solid var(--border)",
+        background:
+            "color-mix(in srgb, var(--bg-secondary) 52%, var(--bg-primary))",
+    },
+    ".cm-mermaid-preview-body": {
+        minHeight: "72px",
+        padding: "16px 10px",
+        color: "var(--text-secondary)",
+        fontSize: "0.9em",
+    },
+    ".cm-mermaid-preview-body-rendered": {
+        display: "flex",
+        justifyContent: "center",
+        alignItems: "center",
+    },
+    ".cm-mermaid-preview svg": {
+        maxWidth: "100%",
+        height: "auto",
+    },
+    ".cm-mermaid-preview-error": {
+        color: "var(--text-secondary)",
+        background: "transparent",
+    },
+    ".cm-mermaid-preview-error-title": {
+        marginBottom: "6px",
+        color: "#ef4444",
+        fontWeight: "700",
+    },
+    ".cm-mermaid-preview-error-message": {
+        margin: "0",
+        padding: "8px 10px",
+        whiteSpace: "pre-wrap",
+        overflowWrap: "anywhere",
+        fontFamily:
+            "ui-monospace, 'SF Mono', Monaco, 'Cascadia Code', monospace",
+        fontSize: "0.86em",
+        color: "var(--text-primary)",
+        background:
+            "color-mix(in srgb, #ef4444 8%, var(--bg-secondary))",
+        border: "1px solid color-mix(in srgb, #ef4444 24%, var(--border))",
+        borderRadius: "6px",
+    },
     ".cm-link-tooltip": {
         position: "fixed",
         zIndex: "1000",
