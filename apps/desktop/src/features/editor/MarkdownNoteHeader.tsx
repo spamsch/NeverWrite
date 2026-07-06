@@ -17,7 +17,9 @@ import {
     statusLabel,
     statusTone,
 } from "../okf/status";
+import { fetchSystemUsername } from "../okf/systemUsername";
 import { useVaultStore } from "../../app/store/vaultStore";
+import { upsertFrontmatterTitle } from "./noteTitleHelpers";
 
 /** Statuses that warrant a trust banner, with their banner copy. */
 const BANNER_COPY: Record<string, string> = {
@@ -98,21 +100,64 @@ export function MarkdownNoteHeader({
         setStatusMenu({ x: rect.left, y: rect.bottom + 4, payload: undefined });
     };
 
-    const setStatus = (next: string | null) => {
-        // Preserve every other key and its order. Only touch `status`.
+    const setStatus = async (next: string | null) => {
+        // Preserve every other key and its order. Only touch `status` and
+        // its attribution key `status_by`.
         let nextEntries: FrontmatterEntry[];
         if (next === null) {
-            nextEntries = entries.filter(
-                (e) => e.key.toLowerCase() !== "status",
-            );
-        } else if (entries.some((e) => e.key.toLowerCase() === "status")) {
-            nextEntries = entries.map((e) =>
-                e.key.toLowerCase() === "status" ? { ...e, value: next } : e,
-            );
+            // Removing the status also removes its attribution.
+            nextEntries = entries.filter((e) => {
+                const key = e.key.toLowerCase();
+                return key !== "status" && key !== "status_by";
+            });
         } else {
-            nextEntries = [...entries, { key: "status", value: next }];
+            if (entries.some((e) => e.key.toLowerCase() === "status")) {
+                nextEntries = entries.map((e) =>
+                    e.key.toLowerCase() === "status"
+                        ? { ...e, value: next }
+                        : e,
+                );
+            } else {
+                nextEntries = [...entries, { key: "status", value: next }];
+            }
+
+            // Record who changed the status. When the username cannot be
+            // determined, omit the field instead of writing a junk value
+            // (any existing attribution is left untouched).
+            const username = await fetchSystemUsername();
+            if (username) {
+                if (
+                    nextEntries.some((e) => e.key.toLowerCase() === "status_by")
+                ) {
+                    nextEntries = nextEntries.map((e) =>
+                        e.key.toLowerCase() === "status_by"
+                            ? { ...e, value: username }
+                            : e,
+                    );
+                } else {
+                    const statusIndex = nextEntries.findIndex(
+                        (e) => e.key.toLowerCase() === "status",
+                    );
+                    nextEntries = [
+                        ...nextEntries.slice(0, statusIndex + 1),
+                        { key: "status_by", value: username },
+                        ...nextEntries.slice(statusIndex + 1),
+                    ];
+                }
+            }
         }
-        onFrontmatterChange(serializeFrontmatterRaw(nextEntries));
+        const nextRaw = serializeFrontmatterRaw(nextEntries);
+
+        // When this status change creates the frontmatter block from scratch,
+        // seed it with the note's title (the same derived title the header
+        // shows) so the new block is `title` + `status`, not `status` alone.
+        // Existing frontmatter is left untouched beyond the status key.
+        if (!frontmatterRaw && next !== null && nextRaw) {
+            onFrontmatterChange(upsertFrontmatterTitle(nextRaw, editableTitle));
+            return;
+        }
+
+        onFrontmatterChange(nextRaw);
     };
 
     const bannerCopy = status ? BANNER_COPY[status] : undefined;
@@ -235,12 +280,12 @@ export function MarkdownNoteHeader({
                     entries={[
                         ...KNOWN_STATUSES.map((s) => ({
                             label: statusLabel(s),
-                            action: () => setStatus(s),
+                            action: () => void setStatus(s),
                         })),
                         { type: "separator" as const },
                         {
                             label: "No status",
-                            action: () => setStatus(null),
+                            action: () => void setStatus(null),
                             danger: true,
                         },
                     ]}

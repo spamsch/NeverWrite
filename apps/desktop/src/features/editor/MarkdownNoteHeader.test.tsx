@@ -1,9 +1,11 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { invoke } from "@neverwrite/runtime";
 import {
     MarkdownNoteHeader,
     type MarkdownNoteHeaderProps,
 } from "./MarkdownNoteHeader";
+import { resetSystemUsernameCacheForTests } from "../okf/systemUsername";
 import { useVaultStore } from "../../app/store/vaultStore";
 
 function renderWith(overrides: Partial<MarkdownNoteHeaderProps> = {}) {
@@ -221,6 +223,10 @@ describe("MarkdownNoteHeader — OKF status", () => {
             configurable: true,
             value: { ready: Promise.resolve() },
         });
+        // The system username is cached module-wide; isolate tests. The
+        // global setup resets the `invoke` mock, so unless a test provides
+        // one, the username resolves to null (no `status_by` written).
+        resetSystemUsernameCacheForTests();
     });
 
     afterEach(() => {
@@ -349,6 +355,150 @@ describe("MarkdownNoteHeader — OKF status", () => {
             .calls[0][0] as string;
         expect(next).toContain("title: Hello");
         expect(next).toContain("status: in_review");
+    });
+
+    it("seeds the new frontmatter block with the note title when created from scratch", async () => {
+        const props = renderWith({
+            editableTitle: "Example note",
+            frontmatterRaw: null,
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: Example note");
+        expect(next).toContain("status: draft");
+        // Title first, then status.
+        expect(next.indexOf("title:")).toBeLessThan(next.indexOf("status:"));
+    });
+
+    it("does not inject a title into existing frontmatter that lacks one", async () => {
+        const props = renderWith({
+            editableTitle: "Example note",
+            frontmatterRaw: fm("type: note"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("type: note");
+        expect(next).toContain("status: draft");
+        expect(next).not.toContain("title:");
+    });
+
+    it("records status_by with the system username on status change", async () => {
+        vi.mocked(invoke).mockResolvedValue("simon");
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello\nstatus: draft\ntype: note"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "Published" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        expect(invoke).toHaveBeenCalledWith("get_system_username");
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("status: published");
+        expect(next).toContain("status_by: simon");
+        expect(next).toContain("type: note");
+        // status_by sits directly after status, before the other keys.
+        expect(next.indexOf("status:")).toBeLessThan(
+            next.indexOf("status_by:"),
+        );
+        expect(next.indexOf("status_by:")).toBeLessThan(
+            next.indexOf("type:"),
+        );
+    });
+
+    it("creates frontmatter from scratch as title, status, status_by", async () => {
+        vi.mocked(invoke).mockResolvedValue("simon");
+        const props = renderWith({
+            editableTitle: "Example note",
+            frontmatterRaw: null,
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: Example note");
+        expect(next).toContain("status: draft");
+        expect(next).toContain("status_by: simon");
+        expect(next.indexOf("title:")).toBeLessThan(next.indexOf("status:"));
+        expect(next.indexOf("status:")).toBeLessThan(
+            next.indexOf("status_by:"),
+        );
+    });
+
+    it("removes status_by along with status when 'No status' is chosen", async () => {
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello\nstatus: draft\nstatus_by: bob"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "No status" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: Hello");
+        expect(next).not.toContain("status:");
+        expect(next).not.toContain("status_by:");
+    });
+
+    it("omits status_by when the username is unavailable", async () => {
+        vi.mocked(invoke).mockResolvedValue(null);
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("status: draft");
+        expect(next).not.toContain("status_by:");
+    });
+
+    it("does not crash and omits status_by when the username fetch fails", async () => {
+        vi.mocked(invoke).mockRejectedValue(new Error("ipc unavailable"));
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("status: draft");
+        expect(next).not.toContain("status_by:");
     });
 });
 

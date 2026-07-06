@@ -43,6 +43,16 @@ own status vocabulary without losing information.
 Empty or whitespace-only values, and any non-string value, are treated as no
 status.
 
+### Status attribution (`status_by`)
+
+When a status is set or changed through the editor's status menu, NeverWrite
+also writes `status_by: <username>` directly after `status`, recording the
+operating system account name of the person who made the change. The username
+comes from the desktop session on macOS, Windows, and Linux alike; if it cannot
+be determined, the field is omitted rather than filled with a placeholder.
+Choosing "No status" removes both `status` and `status_by`. All other
+frontmatter keys keep their order and content.
+
 ## Where status appears
 
 - **File tree dot.** When "Show document status" is enabled (see below), each
