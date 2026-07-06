@@ -213,5 +213,17 @@ describe("ElectronVaultBackend OKF frontmatter", () => {
         })) as { status: string | null; okf_type: string | null };
         expect(detail.status).toBe("published");
         expect(detail.okf_type).toBe("runbook");
+
+        // The save_note response must carry the updated status too: the
+        // renderer ignores user-origin change events and syncs its store
+        // from this response.
+        const saved = (await backend.invoke("save_note", {
+            vaultPath,
+            noteId: "with-meta",
+            content:
+                "---\ntitle: Alpha\nstatus: archived\ntype: runbook\n---\n\nBody\n",
+        })) as { status: string | null; okf_type: string | null };
+        expect(saved.status).toBe("archived");
+        expect(saved.okf_type).toBe("runbook");
     });
 });

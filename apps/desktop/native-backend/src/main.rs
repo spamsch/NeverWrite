@@ -2814,6 +2814,8 @@ fn note_to_detail(note: &NoteDocument) -> NoteDetailDto {
         tags: note.tags.clone(),
         links: note.links.iter().map(|link| link.target.clone()).collect(),
         frontmatter: note.frontmatter.clone(),
+        status: frontmatter_string_field(note.frontmatter.as_ref(), "status"),
+        okf_type: frontmatter_string_field(note.frontmatter.as_ref(), "type"),
     }
 }
 
@@ -3588,8 +3590,11 @@ mod tests {
         assert_eq!(note_a.get("status").and_then(Value::as_str), Some("draft"));
         assert_eq!(note_a.get("okf_type").and_then(Value::as_str), Some("article"));
 
-        // Editing the status produces a change event carrying the new value.
-        invoke(
+        // Editing the status produces a change event carrying the new value,
+        // and the save_note RESPONSE carries it too. The response matters
+        // because the renderer ignores user-origin change events and updates
+        // its store from the response instead (Editor.tsx saveNow).
+        let detail = invoke(
             &backend,
             "save_note",
             json!({
@@ -3599,6 +3604,14 @@ mod tests {
             }),
         )
         .unwrap();
+        assert_eq!(
+            detail.get("status").and_then(Value::as_str),
+            Some("published")
+        );
+        assert_eq!(
+            detail.get("okf_type").and_then(Value::as_str),
+            Some("article")
+        );
         let change = recv_vault_change(&event_rx);
         assert_eq!(change.get("status").and_then(Value::as_str), Some("published"));
         assert_eq!(change.get("okf_type").and_then(Value::as_str), Some("article"));

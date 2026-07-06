@@ -110,6 +110,55 @@ describe("vaultStore", () => {
         expect(useVaultStore.getState().structureRevision).toBe(before + 1);
     });
 
+    it("updates status via updateNoteMetadata and bumps only the structure revision", () => {
+        // Runtime sequence for an app-initiated save: the backend's change
+        // event has origin "user" and is ignored by the renderer, so the
+        // editor pushes status/okf_type from the save_note response through
+        // updateNoteMetadata. The tree rebuild is keyed on structureRevision;
+        // resolver/graph revisions must stay untouched for a status-only edit.
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [
+                {
+                    id: "notes/alpha",
+                    path: "/vault/notes/alpha.md",
+                    title: "Alpha",
+                    modified_at: 1,
+                    created_at: 1,
+                    status: "draft",
+                    okf_type: "runbook",
+                },
+            ],
+        });
+
+        const before = useVaultStore.getState();
+
+        useVaultStore.getState().updateNoteMetadata("notes/alpha", {
+            title: "Alpha",
+            path: "/vault/notes/alpha.md",
+            modified_at: 2,
+            status: "published",
+            okf_type: "runbook",
+        });
+
+        const after = useVaultStore.getState();
+        const note = after.notes.find((n) => n.id === "notes/alpha");
+        expect(note?.status).toBe("published");
+        expect(after.structureRevision).toBe(before.structureRevision + 1);
+        expect(after.resolverRevision).toBe(before.resolverRevision);
+        expect(after.graphRevision).toBe(before.graphRevision);
+
+        // Unchanged status must not churn the structure revision.
+        useVaultStore.getState().updateNoteMetadata("notes/alpha", {
+            modified_at: 3,
+            status: "published",
+            okf_type: "runbook",
+        });
+        expect(useVaultStore.getState().structureRevision).toBe(
+            before.structureRevision + 1,
+        );
+    });
+
     it("sets okfVersion from the open state and resets it when switching vaults", async () => {
         const invokeMock = mockInvoke();
 

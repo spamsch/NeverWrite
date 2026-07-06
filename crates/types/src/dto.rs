@@ -98,6 +98,15 @@ pub struct NoteDetailDto {
     pub tags: Vec<String>,
     pub links: Vec<String>,
     pub frontmatter: Option<serde_json::Value>,
+    /// Raw `status` frontmatter extension field (trimmed string, else null).
+    /// Carried on the save/read response because app-initiated saves emit a
+    /// user-origin change event that the renderer intentionally ignores; the
+    /// response is the only live path for status into the renderer store.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Raw OKF `type` frontmatter field (trimmed string, else null).
+    #[serde(default)]
+    pub okf_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

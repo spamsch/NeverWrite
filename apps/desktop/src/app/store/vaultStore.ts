@@ -142,6 +142,22 @@ function didStructureMetadataChange(
     );
 }
 
+function didMetadataStatusOrTypeChange(
+    previousNotes: NoteDto[],
+    noteId: string,
+    patch: Partial<Pick<NoteDto, "status" | "okf_type">>,
+) {
+    const previous = previousNotes.find((note) => note.id === noteId);
+    if (!previous) return false;
+
+    return (
+        (patch.status !== undefined &&
+            (patch.status ?? null) !== (previous.status ?? null)) ||
+        (patch.okf_type !== undefined &&
+            (patch.okf_type ?? null) !== (previous.okf_type ?? null))
+    );
+}
+
 function didNoteStatusOrTypeChange(
     previousNotes: NoteDto[],
     change: VaultNoteChange,
@@ -469,7 +485,15 @@ interface VaultStore {
     updateNoteMetadata: (
         noteId: string,
         patch: Partial<
-            Pick<NoteDto, "title" | "path" | "modified_at" | "created_at">
+            Pick<
+                NoteDto,
+                | "title"
+                | "path"
+                | "modified_at"
+                | "created_at"
+                | "status"
+                | "okf_type"
+            >
         >,
     ) => void;
 }
@@ -1083,14 +1107,23 @@ export const useVaultStore = create<VaultStore>((set, get) => ({
                 noteId,
                 patch,
             );
+            // Status/type changes only affect presentation (file tree dot),
+            // so they bump structureRevision — which the tree rebuild is keyed
+            // on — but not the resolver/graph revisions.
+            const statusOrTypeChanged = didMetadataStatusOrTypeChange(
+                s.notes,
+                noteId,
+                patch,
+            );
 
             return {
                 notes: s.notes.map((n) =>
                     n.id === noteId ? { ...n, ...patch } : n,
                 ),
-                structureRevision: structureChanged
-                    ? s.structureRevision + 1
-                    : s.structureRevision,
+                structureRevision:
+                    structureChanged || statusOrTypeChanged
+                        ? s.structureRevision + 1
+                        : s.structureRevision,
                 resolverRevision: structureChanged
                     ? s.resolverRevision + 1
                     : s.resolverRevision,

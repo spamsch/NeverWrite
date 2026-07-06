@@ -4020,6 +4020,8 @@ export function FileTree() {
             const detail = await vaultInvoke<{
                 title: string;
                 path: string;
+                status?: string | null;
+                okf_type?: string | null;
             }>("save_note", {
                 noteId: created.id,
                 content,
@@ -4029,6 +4031,8 @@ export function FileTree() {
                 title: detail.title,
                 path: detail.path,
                 modified_at: Math.floor(Date.now() / 1000),
+                status: detail.status ?? null,
+                okf_type: detail.okf_type ?? null,
             });
             touchContent();
             return created;
@@ -4398,6 +4402,8 @@ export function FileTree() {
                 const detail = await vaultInvoke<{
                     title: string;
                     path: string;
+                    status?: string | null;
+                    okf_type?: string | null;
                 }>("save_note", {
                     noteId: created.id,
                     content,
@@ -4407,6 +4413,8 @@ export function FileTree() {
                     title: detail.title,
                     path: detail.path,
                     modified_at: Math.floor(Date.now() / 1000),
+                    status: detail.status ?? null,
+                    okf_type: detail.okf_type ?? null,
                 });
                 touchContent();
             } catch (error) {
