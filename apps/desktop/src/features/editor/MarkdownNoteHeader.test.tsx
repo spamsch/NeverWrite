@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useState } from "react";
 import { invoke } from "@neverwrite/runtime";
 import {
     MarkdownNoteHeader,
@@ -481,6 +482,136 @@ describe("MarkdownNoteHeader — OKF status", () => {
             .calls[0][0] as string;
         expect(next).toContain("status: draft");
         expect(next).not.toContain("status_by:");
+    });
+
+    it("preserves the title across two consecutive status changes with live prop flow", async () => {
+        vi.mocked(invoke).mockResolvedValue("simon");
+        const changes: Array<string | null> = [];
+
+        // Model Editor.tsx's real delivery: applyFrontmatterChange calls
+        // setActiveFrontmatter(nextRaw), which re-renders the header with the
+        // new frontmatterRaw prop.
+        function Harness() {
+            const [raw, setRaw] = useState<string | null>(null);
+            return (
+                <MarkdownNoteHeader
+                    editableTitle="Example note"
+                    lineWrapping
+                    onTitleChange={() => {}}
+                    titleInputRef={{ current: null }}
+                    locationParent="Notes"
+                    frontmatterRaw={raw}
+                    onFrontmatterChange={(next) => {
+                        changes.push(next);
+                        setRaw(next);
+                    }}
+                    propertiesExpanded={false}
+                    onToggleProperties={vi.fn()}
+                    onSearchClick={vi.fn()}
+                />
+            );
+        }
+        render(<Harness />);
+
+        // First change: create frontmatter from scratch.
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        await waitFor(() => expect(changes).toHaveLength(1));
+        expect(changes[0]).toContain("title: Example note");
+        expect(changes[0]).toContain("status: draft");
+        expect(changes[0]).toContain("status_by: simon");
+
+        // Second change: badge now shows Draft; switch to Published.
+        await waitFor(() =>
+            expect(
+                screen.getByRole("button", { name: "Draft" }),
+            ).toBeInTheDocument(),
+        );
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "Published" }));
+        await waitFor(() => expect(changes).toHaveLength(2));
+
+        expect(changes[1]).toContain("title: Example note");
+        expect(changes[1]).toContain("status: published");
+        expect(changes[1]).toContain("status_by: simon");
+    });
+
+    it("preserves an existing title when only the status changes", async () => {
+        vi.mocked(invoke).mockResolvedValue("simon");
+        const props = renderWith({
+            frontmatterRaw: fm("title: My Runbook\nstatus: draft"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: My Runbook");
+        expect(next).toContain("status: archived");
+    });
+
+    it("builds the change from the freshest frontmatter when the raw updates mid-await", async () => {
+        // Regression: the username fetch awaits an IPC round-trip. If a newer
+        // frontmatter raw lands during that await (save response, external
+        // sync), the write must be computed from the fresh raw, not from the
+        // entries captured at click time - otherwise keys that only exist in
+        // the fresh raw (like a just-added title) are silently dropped.
+        let resolveUsername: (value: string) => void = () => {};
+        vi.mocked(invoke).mockImplementation(
+            () =>
+                new Promise((resolve) => {
+                    resolveUsername = resolve as (value: string) => void;
+                }),
+        );
+
+        const onFrontmatterChange = vi.fn();
+        const baseProps: MarkdownNoteHeaderProps = {
+            editableTitle: "Example note",
+            lineWrapping: true,
+            onTitleChange: () => {},
+            titleInputRef: { current: null },
+            locationParent: "Notes",
+            frontmatterRaw: fm("status: draft\nstatus_by: simon"),
+            onFrontmatterChange,
+            propertiesExpanded: false,
+            onToggleProperties: vi.fn(),
+            onSearchClick: vi.fn(),
+        };
+        const { rerender } = render(<MarkdownNoteHeader {...baseProps} />);
+
+        // Click Published; setStatus is now parked on the username fetch.
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "Published" }));
+        // Flush the queued menu action so setStatus starts and the fetch is
+        // actually pending.
+        await act(async () => {});
+        expect(invoke).toHaveBeenCalledWith("get_system_username");
+
+        // A newer raw (title added elsewhere) arrives while the fetch is
+        // pending.
+        rerender(
+            <MarkdownNoteHeader
+                {...baseProps}
+                frontmatterRaw={fm(
+                    "title: My Runbook\nstatus: draft\nstatus_by: simon",
+                )}
+            />,
+        );
+
+        await act(async () => {
+            resolveUsername("simon");
+            await Promise.resolve();
+        });
+
+        await waitFor(() => expect(onFrontmatterChange).toHaveBeenCalled());
+        const next = onFrontmatterChange.mock.calls[0][0] as string;
+        expect(next).toContain("title: My Runbook");
+        expect(next).toContain("status: published");
+        expect(next).toContain("status_by: simon");
     });
 
     it("does not crash and omits status_by when the username fetch fails", async () => {

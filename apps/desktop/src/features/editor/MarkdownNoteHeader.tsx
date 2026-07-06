@@ -1,4 +1,4 @@
-import { useMemo, useState, type RefObject } from "react";
+import { useMemo, useRef, useState, type RefObject } from "react";
 import { MetaBadge, EditableNoteTitle } from "./EditorHeader";
 import {
     FrontmatterBody,
@@ -95,36 +95,51 @@ export function MarkdownNoteHeader({
 
     const [statusMenu, setStatusMenu] = useState<ContextMenuState | null>(null);
 
+    // Latest-prop mirror so async handlers (setStatus awaits the username
+    // IPC) always read the freshest frontmatter, never a stale render
+    // capture. Assigned during render on purpose; it is a pure mirror.
+    const frontmatterRawRef = useRef(frontmatterRaw);
+    frontmatterRawRef.current = frontmatterRaw;
+
     const openStatusMenu = (event: React.MouseEvent<HTMLElement>) => {
         const rect = event.currentTarget.getBoundingClientRect();
         setStatusMenu({ x: rect.left, y: rect.bottom + 4, payload: undefined });
     };
 
     const setStatus = async (next: string | null) => {
+        // Resolve attribution BEFORE reading the frontmatter. The username
+        // fetch awaits an IPC round-trip, and a newer raw can land during
+        // that await (autosave response, external sync). Computing the change
+        // from render-captured entries here used to clobber keys that only
+        // existed in the fresher raw, e.g. a just-added title.
+        const username = next === null ? null : await fetchSystemUsername();
+
+        const currentRaw = frontmatterRawRef.current;
+        const current = currentRaw ? parseFrontmatterRaw(currentRaw) : [];
+
         // Preserve every other key and its order. Only touch `status` and
         // its attribution key `status_by`.
         let nextEntries: FrontmatterEntry[];
         if (next === null) {
             // Removing the status also removes its attribution.
-            nextEntries = entries.filter((e) => {
+            nextEntries = current.filter((e) => {
                 const key = e.key.toLowerCase();
                 return key !== "status" && key !== "status_by";
             });
         } else {
-            if (entries.some((e) => e.key.toLowerCase() === "status")) {
-                nextEntries = entries.map((e) =>
+            if (current.some((e) => e.key.toLowerCase() === "status")) {
+                nextEntries = current.map((e) =>
                     e.key.toLowerCase() === "status"
                         ? { ...e, value: next }
                         : e,
                 );
             } else {
-                nextEntries = [...entries, { key: "status", value: next }];
+                nextEntries = [...current, { key: "status", value: next }];
             }
 
-            // Record who changed the status. When the username cannot be
-            // determined, omit the field instead of writing a junk value
-            // (any existing attribution is left untouched).
-            const username = await fetchSystemUsername();
+            // When the username cannot be determined, omit the field instead
+            // of writing a junk value (any existing attribution is left
+            // untouched).
             if (username) {
                 if (
                     nextEntries.some((e) => e.key.toLowerCase() === "status_by")
@@ -152,7 +167,7 @@ export function MarkdownNoteHeader({
         // seed it with the note's title (the same derived title the header
         // shows) so the new block is `title` + `status`, not `status` alone.
         // Existing frontmatter is left untouched beyond the status key.
-        if (!frontmatterRaw && next !== null && nextRaw) {
+        if (!currentRaw && next !== null && nextRaw) {
             onFrontmatterChange(upsertFrontmatterTitle(nextRaw, editableTitle));
             return;
         }
