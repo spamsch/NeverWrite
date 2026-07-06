@@ -467,9 +467,9 @@ function entryKind(fileName: string, isDirectory: boolean): VaultEntryKind {
 }
 
 function deriveTitle(filePath: string, content: string) {
-    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-    if (frontmatterMatch) {
-        const titleMatch = frontmatterMatch[1]?.match(/^title:\s*(.+)$/m);
+    const frontmatter = extractFrontmatterBlock(content);
+    if (frontmatter !== null) {
+        const titleMatch = frontmatter.match(/^title:\s*(.+)$/m);
         const title = titleMatch?.[1]?.trim().replace(/^["']|["']$/g, "");
         if (title) return title;
     }
@@ -483,34 +483,55 @@ function deriveTitle(filePath: string, content: string) {
     return path.basename(filePath, path.extname(filePath)) || "Untitled";
 }
 
+// Accepts both LF and CRLF newlines around the `---` delimiters, matching the
+// Rust backend which parses CRLF frontmatter via serde_yaml.
+function extractFrontmatterBlock(content: string): string | null {
+    const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    return match ? (match[1] ?? "") : null;
+}
+
 /**
- * Extract the OKF `status` and `type` frontmatter fields, mirroring the Rust
- * backend rules: only plain string scalars are accepted, values are trimmed,
- * and empty strings resolve to `null`. Non-scalar YAML (lists/maps/block
- * scalars) is treated as absent.
+ * Read a frontmatter field, mirroring the Rust backend rules: only plain
+ * string scalars are accepted, values are trimmed, and empty strings resolve
+ * to `null`. Non-scalar YAML (lists/maps/block scalars) is treated as absent.
  */
+function readFrontmatterStringField(body: string, key: string): string | null {
+    const match = body.match(new RegExp(`^${key}:[ \\t]*(.*)$`, "m"));
+    if (!match) return null;
+    let value = (match[1] ?? "").trim();
+    // Reject YAML non-scalar indicators (lists, maps, block scalars).
+    if (/^[[{|>&*!]/.test(value)) return null;
+    // Strip a single pair of surrounding quotes.
+    value = value.replace(/^["'](.*)["']$/, "$1").trim();
+    return value === "" ? null : value;
+}
+
+/** Extract the OKF `status` and `type` frontmatter fields. */
 function extractOkfMeta(content: string): {
     status: string | null;
     okf_type: string | null;
 } {
-    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!frontmatterMatch) return { status: null, okf_type: null };
-
-    const body = frontmatterMatch[1] ?? "";
-    const readField = (key: string): string | null => {
-        const match = body.match(
-            new RegExp(`^${key}:[ \\t]*(.*)$`, "m"),
-        );
-        if (!match) return null;
-        let value = (match[1] ?? "").trim();
-        // Reject YAML non-scalar indicators (lists, maps, block scalars).
-        if (/^[[{|>&*!]/.test(value)) return null;
-        // Strip a single pair of surrounding quotes.
-        value = value.replace(/^["'](.*)["']$/, "$1").trim();
-        return value === "" ? null : value;
+    const body = extractFrontmatterBlock(content);
+    if (body === null) return { status: null, okf_type: null };
+    return {
+        status: readFrontmatterStringField(body, "status"),
+        okf_type: readFrontmatterStringField(body, "type"),
     };
+}
 
-    return { status: readField("status"), okf_type: readField("type") };
+/**
+ * Detect the OKF version declared by the vault-root `index.md`, mirroring the
+ * Rust `Vault::detect_okf_version`: only the root file is inspected, and only
+ * a non-empty string scalar counts.
+ */
+async function detectOkfVersion(root: string): Promise<string | null> {
+    const content = await fs
+        .readFile(path.join(root, "index.md"), "utf8")
+        .catch(() => null);
+    if (content === null) return null;
+    const body = extractFrontmatterBlock(content);
+    if (body === null) return null;
+    return readFrontmatterStringField(body, "okf_version");
 }
 
 function extractTags(content: string) {
@@ -1149,7 +1170,10 @@ export class ElectronVaultBackend {
         });
 
         try {
-            const snapshot = await scanVault(vaultPath);
+            const [snapshot, okfVersion] = await Promise.all([
+                scanVault(vaultPath),
+                detectOkfVersion(vaultPath),
+            ]);
             snapshots.set(vaultPath, snapshot);
             openStates.set(vaultPath, {
                 ...idleOpenState,
@@ -1159,6 +1183,7 @@ export class ElectronVaultBackend {
                 processed: snapshot.entries.length,
                 total: snapshot.entries.length,
                 note_count: snapshot.notes.length,
+                okf_version: okfVersion,
                 started_at_ms: started,
                 finished_at_ms: Date.now(),
                 metrics: {
