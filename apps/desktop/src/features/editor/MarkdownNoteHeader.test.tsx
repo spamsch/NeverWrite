@@ -1,6 +1,28 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { MarkdownNoteHeader } from "./MarkdownNoteHeader";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+    MarkdownNoteHeader,
+    type MarkdownNoteHeaderProps,
+} from "./MarkdownNoteHeader";
+import { useVaultStore } from "../../app/store/vaultStore";
+
+function renderWith(overrides: Partial<MarkdownNoteHeaderProps> = {}) {
+    const props: MarkdownNoteHeaderProps = {
+        editableTitle: "Example note",
+        lineWrapping: true,
+        onTitleChange: () => {},
+        titleInputRef: { current: null },
+        locationParent: "Notes",
+        frontmatterRaw: null,
+        onFrontmatterChange: vi.fn(),
+        propertiesExpanded: false,
+        onToggleProperties: vi.fn(),
+        onSearchClick: vi.fn(),
+        ...overrides,
+    };
+    render(<MarkdownNoteHeader {...props} />);
+    return props;
+}
 
 function renderHeader(lineWrapping: boolean) {
     render(
@@ -185,5 +207,195 @@ describe("MarkdownNoteHeader", () => {
                 ).scrollHeight;
             }
         }
+    });
+});
+
+const fm = (body: string) => `---\n${body}\n---\n`;
+
+describe("MarkdownNoteHeader — OKF status", () => {
+    // Earlier tests in this file leave `document.fonts` defined-but-undefined,
+    // which makes EditableNoteTitle's `document.fonts.ready` throw. Ensure a
+    // usable stub so these renders don't crash on that unrelated effect.
+    beforeEach(() => {
+        Object.defineProperty(document, "fonts", {
+            configurable: true,
+            value: { ready: Promise.resolve() },
+        });
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it("renders a status badge for each canonical status", () => {
+        const cases: Array<[string, string]> = [
+            ["draft", "Draft"],
+            ["in_review", "In review"],
+            ["published", "Published"],
+            ["deprecated", "Deprecated"],
+            ["archived", "Archived"],
+        ];
+        for (const [raw, label] of cases) {
+            const { unmount } = render(
+                <MarkdownNoteHeader
+                    editableTitle="Example note"
+                    lineWrapping
+                    onTitleChange={() => {}}
+                    titleInputRef={{ current: null }}
+                    locationParent="Notes"
+                    frontmatterRaw={fm(`status: ${raw}`)}
+                    onFrontmatterChange={vi.fn()}
+                    propertiesExpanded={false}
+                    onToggleProperties={vi.fn()}
+                    onSearchClick={vi.fn()}
+                />,
+            );
+            expect(
+                screen.getByRole("button", { name: label }),
+            ).toBeInTheDocument();
+            unmount();
+        }
+    });
+
+    it("shows a subtle 'Set status' affordance and no banner when status is absent", () => {
+        renderWith({ frontmatterRaw: null });
+        expect(
+            screen.getByRole("button", { name: "Set status" }),
+        ).toBeInTheDocument();
+        expect(document.querySelector("[data-status-banner]")).toBeNull();
+        expect(
+            screen.queryByRole("button", { name: "Draft" }),
+        ).not.toBeInTheDocument();
+    });
+
+    it("renders a type badge showing the raw type value", () => {
+        renderWith({ frontmatterRaw: fm("type: runbook") });
+        expect(screen.getByText("runbook")).toBeInTheDocument();
+    });
+
+    it.each([
+        ["draft", "Draft — this document has not been published."],
+        ["in_review", "In review — content may change before publication."],
+        ["deprecated", "Deprecated — this document is outdated."],
+        ["archived", "Archived — kept for reference only."],
+    ])("renders the trust banner for %s", (raw, copy) => {
+        renderWith({ frontmatterRaw: fm(`status: ${raw}`) });
+        const banner = document.querySelector("[data-status-banner]");
+        expect(banner).not.toBeNull();
+        expect(banner).toHaveTextContent(copy);
+    });
+
+    it("renders no banner for published", () => {
+        renderWith({ frontmatterRaw: fm("status: published") });
+        expect(document.querySelector("[data-status-banner]")).toBeNull();
+    });
+
+    it("shows an unknown status verbatim with no banner", () => {
+        renderWith({ frontmatterRaw: fm("status: needs work") });
+        expect(
+            screen.getByRole("button", { name: "needs work" }),
+        ).toBeInTheDocument();
+        expect(document.querySelector("[data-status-banner]")).toBeNull();
+    });
+
+    it("updates the status via the dropdown while preserving other keys and order", async () => {
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello\nstatus: draft\ntype: note"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "Published" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: Hello");
+        expect(next).toContain("status: published");
+        expect(next).toContain("type: note");
+        // Order preserved: title before status before type.
+        expect(next.indexOf("title")).toBeLessThan(next.indexOf("status"));
+        expect(next.indexOf("status")).toBeLessThan(next.indexOf("type"));
+    });
+
+    it("removes the status key when 'No status' is chosen", async () => {
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello\nstatus: draft"),
+        });
+
+        fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+        fireEvent.click(screen.getByRole("button", { name: "No status" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: Hello");
+        expect(next).not.toContain("status:");
+    });
+
+    it("adds a status when none exists via 'Set status'", async () => {
+        const props = renderWith({ frontmatterRaw: fm("title: Hello") });
+
+        fireEvent.click(screen.getByRole("button", { name: "Set status" }));
+        fireEvent.click(screen.getByRole("button", { name: "In review" }));
+
+        await waitFor(() =>
+            expect(props.onFrontmatterChange).toHaveBeenCalled(),
+        );
+        const next = (props.onFrontmatterChange as ReturnType<typeof vi.fn>).mock
+            .calls[0][0] as string;
+        expect(next).toContain("title: Hello");
+        expect(next).toContain("status: in_review");
+    });
+});
+
+describe("MarkdownNoteHeader — OKF conformance hint", () => {
+    beforeEach(() => {
+        Object.defineProperty(document, "fonts", {
+            configurable: true,
+            value: { ready: Promise.resolve() },
+        });
+    });
+
+    afterEach(() => {
+        useVaultStore.setState({ okfVersion: null });
+        vi.restoreAllMocks();
+    });
+
+    it("shows the hint when the vault is OKF and the note has no type", () => {
+        useVaultStore.setState({ okfVersion: "0.1.0" });
+        renderWith({ frontmatterRaw: fm("title: Hello") });
+        expect(
+            screen.getByRole("button", { name: "No OKF type" }),
+        ).toBeInTheDocument();
+    });
+
+    it("hides the hint when the note already has a type", () => {
+        useVaultStore.setState({ okfVersion: "0.1.0" });
+        renderWith({ frontmatterRaw: fm("type: runbook") });
+        expect(
+            screen.queryByRole("button", { name: "No OKF type" }),
+        ).not.toBeInTheDocument();
+    });
+
+    it("hides the hint when the vault is not an OKF vault", () => {
+        useVaultStore.setState({ okfVersion: null });
+        renderWith({ frontmatterRaw: fm("title: Hello") });
+        expect(
+            screen.queryByRole("button", { name: "No OKF type" }),
+        ).not.toBeInTheDocument();
+    });
+
+    it("opens the Properties panel when the hint is clicked", () => {
+        useVaultStore.setState({ okfVersion: "0.1.0" });
+        const props = renderWith({
+            frontmatterRaw: fm("title: Hello"),
+            propertiesExpanded: false,
+        });
+        fireEvent.click(screen.getByRole("button", { name: "No OKF type" }));
+        expect(props.onToggleProperties).toHaveBeenCalledTimes(1);
     });
 });

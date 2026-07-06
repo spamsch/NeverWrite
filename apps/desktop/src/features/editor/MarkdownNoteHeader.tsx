@@ -1,6 +1,31 @@
-import { type RefObject } from "react";
+import { useMemo, useState, type RefObject } from "react";
 import { MetaBadge, EditableNoteTitle } from "./EditorHeader";
-import { FrontmatterBody } from "./FrontmatterPanel";
+import {
+    FrontmatterBody,
+    parseFrontmatterRaw,
+    serializeFrontmatterRaw,
+    type FrontmatterEntry,
+} from "./FrontmatterPanel";
+import {
+    ContextMenu,
+    type ContextMenuState,
+} from "../../components/context-menu/ContextMenu";
+import {
+    KNOWN_STATUSES,
+    normalizeDocumentStatus,
+    statusDotColor,
+    statusLabel,
+    statusTone,
+} from "../okf/status";
+import { useVaultStore } from "../../app/store/vaultStore";
+
+/** Statuses that warrant a trust banner, with their banner copy. */
+const BANNER_COPY: Record<string, string> = {
+    draft: "Draft — this document has not been published.",
+    in_review: "In review — content may change before publication.",
+    deprecated: "Deprecated — this document is outdated.",
+    archived: "Archived — kept for reference only.",
+};
 
 export interface MarkdownNoteHeaderProps {
     /** Current editable title text */
@@ -40,6 +65,58 @@ export function MarkdownNoteHeader({
     onToggleProperties,
     onSearchClick,
 }: MarkdownNoteHeaderProps) {
+    const entries = useMemo<FrontmatterEntry[]>(
+        () => (frontmatterRaw ? parseFrontmatterRaw(frontmatterRaw) : []),
+        [frontmatterRaw],
+    );
+
+    const rawStatus = useMemo(() => {
+        const entry = entries.find((e) => e.key.toLowerCase() === "status");
+        return entry && typeof entry.value === "string" ? entry.value : null;
+    }, [entries]);
+    const status = useMemo(
+        () => normalizeDocumentStatus(rawStatus),
+        [rawStatus],
+    );
+
+    const typeValue = useMemo(() => {
+        const entry = entries.find((e) => e.key.toLowerCase() === "type");
+        const value =
+            entry && typeof entry.value === "string" ? entry.value.trim() : "";
+        return value || null;
+    }, [entries]);
+
+    const okfVersion = useVaultStore((s) => s.okfVersion);
+    // Conformance hint: OKF vaults expect a `type` field. Only nudge when we
+    // know this is an OKF vault and the note is missing a non-empty type.
+    const showMissingTypeHint = okfVersion !== null && typeValue === null;
+
+    const [statusMenu, setStatusMenu] = useState<ContextMenuState | null>(null);
+
+    const openStatusMenu = (event: React.MouseEvent<HTMLElement>) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        setStatusMenu({ x: rect.left, y: rect.bottom + 4, payload: undefined });
+    };
+
+    const setStatus = (next: string | null) => {
+        // Preserve every other key and its order. Only touch `status`.
+        let nextEntries: FrontmatterEntry[];
+        if (next === null) {
+            nextEntries = entries.filter(
+                (e) => e.key.toLowerCase() !== "status",
+            );
+        } else if (entries.some((e) => e.key.toLowerCase() === "status")) {
+            nextEntries = entries.map((e) =>
+                e.key.toLowerCase() === "status" ? { ...e, value: next } : e,
+            );
+        } else {
+            nextEntries = [...entries, { key: "status", value: next }];
+        }
+        onFrontmatterChange(serializeFrontmatterRaw(nextEntries));
+    };
+
+    const bannerCopy = status ? BANNER_COPY[status] : undefined;
+
     return (
         <div
             data-editor-note-header="true"
@@ -63,21 +140,43 @@ export function MarkdownNoteHeader({
                     margin: lineWrapping ? "0 auto" : "0",
                 }}
             >
-                {/* Location breadcrumb */}
-                {locationParent && (
-                    <div
-                        style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 8,
-                            flexWrap: "wrap",
-                            minWidth: 0,
-                            marginBottom: 14,
-                        }}
-                    >
-                        <MetaBadge label={locationParent} />
-                    </div>
-                )}
+                {/* Location breadcrumb + OKF status / type badges */}
+                <div
+                    style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        flexWrap: "wrap",
+                        minWidth: 0,
+                        marginBottom: 14,
+                    }}
+                >
+                    {locationParent && <MetaBadge label={locationParent} />}
+                    {status ? (
+                        <MetaBadge
+                            label={statusLabel(status)}
+                            tone={statusTone(status)}
+                            title="Change status"
+                            onClick={openStatusMenu}
+                            leading={
+                                <StatusDot color={statusDotColor(status)} />
+                            }
+                        />
+                    ) : (
+                        <SetStatusButton onClick={openStatusMenu} />
+                    )}
+                    {typeValue && <MetaBadge label={typeValue} tone="muted" />}
+                    {showMissingTypeHint && (
+                        <MetaBadge
+                            label="No OKF type"
+                            tone="muted"
+                            title="OKF vaults expect a type field in frontmatter"
+                            onClick={() => {
+                                if (!propertiesExpanded) onToggleProperties();
+                            }}
+                        />
+                    )}
+                </div>
 
                 {/* Title row */}
                 <EditableNoteTitle
@@ -112,6 +211,11 @@ export function MarkdownNoteHeader({
                     />
                 </div>
 
+                {/* Trust banner (draft / in_review / deprecated / archived) */}
+                {status && bannerCopy && (
+                    <TrustBanner status={status} copy={bannerCopy} />
+                )}
+
                 {/* Properties body (expanded below toolbar) */}
                 {propertiesExpanded && (
                     <div style={{ minWidth: 0, marginBottom: 8 }}>
@@ -122,6 +226,105 @@ export function MarkdownNoteHeader({
                     </div>
                 )}
             </div>
+
+            {statusMenu && (
+                <ContextMenu
+                    menu={statusMenu}
+                    onClose={() => setStatusMenu(null)}
+                    minWidth={160}
+                    entries={[
+                        ...KNOWN_STATUSES.map((s) => ({
+                            label: statusLabel(s),
+                            action: () => setStatus(s),
+                        })),
+                        { type: "separator" as const },
+                        {
+                            label: "No status",
+                            action: () => setStatus(null),
+                            danger: true,
+                        },
+                    ]}
+                />
+            )}
+        </div>
+    );
+}
+
+/* ── OKF status UI ─────────────────────────────────────────── */
+
+function StatusDot({ color }: { color: string }) {
+    return (
+        <span
+            aria-hidden="true"
+            style={{
+                width: 7,
+                height: 7,
+                borderRadius: "50%",
+                background: color,
+                flexShrink: 0,
+            }}
+        />
+    );
+}
+
+function SetStatusButton({
+    onClick,
+}: {
+    onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
+}) {
+    return (
+        <button
+            type="button"
+            onClick={onClick}
+            title="Set status"
+            style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                height: 24,
+                padding: "0 8px",
+                borderRadius: 2,
+                border: "1px dashed color-mix(in srgb, var(--border) 90%, transparent)",
+                background: "transparent",
+                color: "var(--text-secondary)",
+                fontSize: 11,
+                fontWeight: 600,
+                letterSpacing: "0.04em",
+                cursor: "pointer",
+                opacity: 0.7,
+            }}
+        >
+            <StatusDot color="var(--text-secondary)" />
+            Set status
+        </button>
+    );
+}
+
+function TrustBanner({ status, copy }: { status: string; copy: string }) {
+    const base = statusDotColor(status);
+    return (
+        <div
+            role="note"
+            data-status-banner={status}
+            style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                width: "100%",
+                boxSizing: "border-box",
+                padding: "6px 10px",
+                marginBottom: 8,
+                borderRadius: 4,
+                border: `1px solid color-mix(in srgb, ${base} 22%, var(--border))`,
+                background: `color-mix(in srgb, ${base} 10%, transparent)`,
+                color: "var(--text-secondary)",
+                fontSize: 12,
+                fontWeight: 500,
+                lineHeight: 1.4,
+            }}
+        >
+            <StatusDot color={base} />
+            <span>{copy}</span>
         </div>
     );
 }

@@ -18,6 +18,8 @@ interface NoteDto {
     title: string;
     modified_at: number;
     created_at: number;
+    status: string | null;
+    okf_type: string | null;
 }
 
 interface NoteDetailDto extends NoteDto {
@@ -72,6 +74,7 @@ interface VaultOpenState {
         snapshot_save_ms: number;
     };
     error: string | null;
+    okf_version: string | null;
 }
 
 interface SearchResultDto {
@@ -107,6 +110,8 @@ interface VaultNoteChange {
     revision: number;
     content_hash: string | null;
     graph_revision: number;
+    status: string | null;
+    okf_type: string | null;
 }
 
 const ignoredDirNames = new Set([
@@ -197,6 +202,7 @@ const idleOpenState: VaultOpenState = {
         snapshot_save_ms: 0,
     },
     error: null,
+    okf_version: null,
 };
 
 function normalizePathForDto(value: string) {
@@ -477,6 +483,36 @@ function deriveTitle(filePath: string, content: string) {
     return path.basename(filePath, path.extname(filePath)) || "Untitled";
 }
 
+/**
+ * Extract the OKF `status` and `type` frontmatter fields, mirroring the Rust
+ * backend rules: only plain string scalars are accepted, values are trimmed,
+ * and empty strings resolve to `null`. Non-scalar YAML (lists/maps/block
+ * scalars) is treated as absent.
+ */
+function extractOkfMeta(content: string): {
+    status: string | null;
+    okf_type: string | null;
+} {
+    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!frontmatterMatch) return { status: null, okf_type: null };
+
+    const body = frontmatterMatch[1] ?? "";
+    const readField = (key: string): string | null => {
+        const match = body.match(
+            new RegExp(`^${key}:[ \\t]*(.*)$`, "m"),
+        );
+        if (!match) return null;
+        let value = (match[1] ?? "").trim();
+        // Reject YAML non-scalar indicators (lists, maps, block scalars).
+        if (/^[[{|>&*!]/.test(value)) return null;
+        // Strip a single pair of surrounding quotes.
+        value = value.replace(/^["'](.*)["']$/, "$1").trim();
+        return value === "" ? null : value;
+    };
+
+    return { status: readField("status"), okf_type: readField("type") };
+}
+
 function extractTags(content: string) {
     return [
         ...new Set(
@@ -553,12 +589,15 @@ async function walkVault(root: string, dir = root): Promise<VaultEntryDto[]> {
 
 async function noteFromEntry(entry: VaultEntryDto): Promise<NoteDto> {
     const content = await fs.readFile(entry.path, "utf8").catch(() => "");
+    const okf = extractOkfMeta(content);
     return {
         id: entry.id,
         path: entry.path,
         title: deriveTitle(entry.path, content),
         modified_at: entry.modified_at,
         created_at: entry.created_at,
+        status: okf.status,
+        okf_type: okf.okf_type,
     };
 }
 
@@ -607,12 +646,15 @@ async function readNoteDetail(vaultPath: string, noteId: string): Promise<NoteDe
     const { absolutePath } = resolveVaultScopedPath(vaultPath, noteIdToRelativePath(noteId));
     const content = await fs.readFile(absolutePath, "utf8");
     const stat = await fs.stat(absolutePath);
+    const okf = extractOkfMeta(content);
     return {
         id: withoutExtension(normalizePathForDto(path.relative(toAbsoluteVaultPath(vaultPath), absolutePath))),
         path: absolutePath,
         title: deriveTitle(absolutePath, content),
         modified_at: Math.floor(stat.mtimeMs / 1000),
         created_at: Math.floor(stat.birthtimeMs / 1000),
+        status: okf.status,
+        okf_type: okf.okf_type,
         content,
         tags: extractTags(content),
         links: extractLinks(content),
@@ -658,6 +700,8 @@ function buildChange(args: {
         revision: nextRevision(args.vaultPath),
         content_hash: args.content == null ? null : contentHash(args.content),
         graph_revision: 1,
+        status: args.note?.status ?? null,
+        okf_type: args.note?.okf_type ?? null,
     };
 }
 

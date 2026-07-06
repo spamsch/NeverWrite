@@ -166,3 +166,52 @@ describe("ElectronVaultBackend vault classification", () => {
         }
     });
 });
+
+describe("ElectronVaultBackend OKF frontmatter", () => {
+    it("reads status and type from note frontmatter for list_notes and read_note", async () => {
+        const vaultPath = await fs.mkdtemp(
+            path.join(os.tmpdir(), "neverwrite-okf-"),
+        );
+        await fs.writeFile(
+            path.join(vaultPath, "with-meta.md"),
+            "---\ntitle: Alpha\nstatus: published\ntype: runbook\n---\n\nBody\n",
+            "utf8",
+        );
+        await fs.writeFile(
+            path.join(vaultPath, "blank-status.md"),
+            "---\ntitle: Beta\nstatus:   \n---\n\nBody\n",
+            "utf8",
+        );
+        await fs.writeFile(
+            path.join(vaultPath, "no-meta.md"),
+            "# Gamma\n\nBody\n",
+            "utf8",
+        );
+
+        const backend = new ElectronVaultBackend(vi.fn(), createUpdater(), null);
+        await backend.invoke("start_open_vault", { path: vaultPath });
+
+        const notes = (await backend.invoke("list_notes", {
+            vaultPath,
+        })) as Array<{ id: string; status: string | null; okf_type: string | null }>;
+
+        const withMeta = notes.find((note) => note.id === "with-meta");
+        expect(withMeta).toMatchObject({
+            status: "published",
+            okf_type: "runbook",
+        });
+
+        const blank = notes.find((note) => note.id === "blank-status");
+        expect(blank).toMatchObject({ status: null, okf_type: null });
+
+        const noMeta = notes.find((note) => note.id === "no-meta");
+        expect(noMeta).toMatchObject({ status: null, okf_type: null });
+
+        const detail = (await backend.invoke("read_note", {
+            vaultPath,
+            noteId: "with-meta",
+        })) as { status: string | null; okf_type: string | null };
+        expect(detail.status).toBe("published");
+        expect(detail.okf_type).toBe("runbook");
+    });
+});
